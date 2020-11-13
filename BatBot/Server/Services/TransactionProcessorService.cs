@@ -129,87 +129,87 @@ namespace BatBot.Server.Services
 
                 #endregion
 
-                #region Preparation
-
-                var frontRunAmountIn = swap.AmountToSend;
-                BigInteger frontRunAmountOutMin;
-                BigInteger targetSwapAmountOut;
-
-                do
+                try
                 {
-                    // Find the optimal amount to front run with by inferring the effect of slippage from iterative queries to the smart contract.
-                    frontRunAmountOutMin = await GetAmountOut(prepWeb3, frontRunAmountIn, swap.Path);
-                    targetSwapAmountOut = await GetAmountOut(prepWeb3, swap.AmountToSend + frontRunAmountIn, swap.Path) - frontRunAmountOutMin;
+                    #region Preparation
 
-                    var frontRunAmountInMin = Web3.Convert.ToWei(_settingsOptions.MinimumFrontRunEth);
-                    var frontRunAmountInMax = Web3.Convert.ToWei(_settingsOptions.MaximumFrontRunEth);
+                    var frontRunAmountIn = swap.AmountToSend;
+                    BigInteger frontRunAmountOutMin;
+                    BigInteger targetSwapAmountOut;
 
-                    if (_settingsOptions.YoloMode) break;
-
-                    var targetSwapAmountOutAboveMin = targetSwapAmountOut > (swap.AmountOutMin * (Rational)(1 + _settingsOptions.TargetSwapAmountOutToleranceMin)).WholePart;
-                    var targetSwapAmountOutBelowMax = targetSwapAmountOut < (swap.AmountOutMin * (Rational)(1 + _settingsOptions.TargetSwapAmountOutToleranceMax)).WholePart;
-                    if (targetSwapAmountOutAboveMin && targetSwapAmountOutBelowMax) break;
-
-                    if (targetSwapAmountOutBelowMax && frontRunAmountIn == frontRunAmountInMin)
+                    do
                     {
-                        await SendPreFrontRunMessage("⛔ Amount in is too low to front run", MessageTier.End);
+                        // Find the optimal amount to front run with by inferring the effect of slippage from iterative queries to the smart contract.
+                        frontRunAmountOutMin = await GetAmountOut(prepWeb3, frontRunAmountIn, swap.Path);
+                        targetSwapAmountOut = await GetAmountOut(prepWeb3, swap.AmountToSend + frontRunAmountIn, swap.Path) - frontRunAmountOutMin;
+
+                        var frontRunAmountInMin = Web3.Convert.ToWei(_settingsOptions.MinimumFrontRunEth);
+                        var frontRunAmountInMax = Web3.Convert.ToWei(_settingsOptions.MaximumFrontRunEth);
+
+                        if (_settingsOptions.YoloMode) break;
+
+                        var targetSwapAmountOutAboveMin = targetSwapAmountOut > (swap.AmountOutMin * (Rational)(1 + _settingsOptions.TargetSwapAmountOutToleranceMin)).WholePart;
+                        var targetSwapAmountOutBelowMax = targetSwapAmountOut < (swap.AmountOutMin * (Rational)(1 + _settingsOptions.TargetSwapAmountOutToleranceMax)).WholePart;
+                        if (targetSwapAmountOutAboveMin && targetSwapAmountOutBelowMax) break;
+
+                        if (targetSwapAmountOutBelowMax && frontRunAmountIn == frontRunAmountInMin)
+                        {
+                            await SendPreFrontRunMessage("⛔ Amount in is too low to front run", MessageTier.End);
+                            return;
+                        }
+
+                        if (targetSwapAmountOutAboveMin && frontRunAmountIn == frontRunAmountInMax)
+                        {
+                            await SendPreFrontRunMessage("💯 Amount in to front run is at configured maximum", MessageTier.Single);
+                            break;
+                        }
+
+                        // Adjust front run amount iteratively to get as close as possible to the amount that won't cause the target swap to fail, but keep within configured bounds.
+                        frontRunAmountIn = BigInteger.Max(BigInteger.Min((frontRunAmountIn * (Rational)(targetSwapAmountOutBelowMax ? 0.5 : 1.5)).WholePart, frontRunAmountInMax), frontRunAmountInMin);
+                    } while (true);
+
+                    // Calculate the slippage as the difference between the amounts out and amounts in ratios, then compare to the tolerance.
+                    var slippage = new Rational(frontRunAmountOutMin) / new Rational(targetSwapAmountOut) / (new Rational(frontRunAmountIn) / new Rational(swap.AmountToSend)) - 1;
+                    if (!_settingsOptions.YoloMode && slippage < (Rational)_settingsOptions.SlippageTolerance)
+                    {
+                        await SendPreFrontRunMessage($"⛔ Slippage ({(double)slippage:P}) too tight to front run", MessageTier.End);
                         return;
                     }
 
-                    if (targetSwapAmountOutAboveMin && frontRunAmountIn == frontRunAmountInMax)
+                    // Prepare the front run message, and set with a higher gas price than the target swap.
+                    var frontRunBuyMessage = new SwapExactEthForTokensFunction
                     {
-                        await SendPreFrontRunMessage("💯 Amount in to front run is at configured maximum", MessageTier.End);
-                        break;
+                        AmountToSend = frontRunAmountIn,
+                        AmountOutMin = (frontRunAmountOutMin * (Rational)0.999).WholePart,
+                        Path = swap.Path,
+                        To = _batBotOptions.FrontRunWalletAddress,
+                        Deadline = swap.Deadline,
+                        GasPrice = (swap.GasPrice.GetValueOrDefault() * (Rational)_settingsOptions.FrontRunGasPriceFactor).WholePart,
+                        Gas = swap.Gas
+                    };
+
+                    // Prepare the sell message for later selling the front run tokens that will be bought.
+                    var frontRunSellMessage = new SwapExactTokensForEthFunction
+                    {
+                        AmountOutMin = 0,
+                        Path = Enumerable.Reverse(frontRunBuyMessage.Path).ToList(),
+                        To = _batBotOptions.FrontRunWalletAddress,
+                        Deadline = DateTimeOffset.UtcNow.AddMinutes(20).ToUnixTimeSeconds()
+                    };
+
+                    #endregion
+
+                    #region Prechecks
+
+                    // Check that the front run swap will in fact succeed before front running.
+                    if (await GetAmountOut(prepWeb3, frontRunBuyMessage.AmountToSend, frontRunBuyMessage.Path) < frontRunBuyMessage.AmountOutMin)
+                    {
+                        await SendPreFrontRunMessage("‼️ Aborting (not front running) due to insufficient output amount on front run swap", MessageTier.End);
+                        return;
                     }
 
-                    // Adjust front run amount iteratively to get as close as possible to the amount that won't cause the target swap to fail, but keep within configured bounds.
-                    frontRunAmountIn = BigInteger.Max(BigInteger.Min((frontRunAmountIn * (Rational)(targetSwapAmountOutBelowMax ? 0.5 : 1.5)).WholePart, frontRunAmountInMax), frontRunAmountInMin);
-                } while (true);
+                    #endregion
 
-                // Calculate the slippage as the difference between the amounts out and amounts in ratios, then compare to the tolerance.
-                var slippage = new Rational(frontRunAmountOutMin) / new Rational(targetSwapAmountOut) / (new Rational(frontRunAmountIn) / new Rational(swap.AmountToSend)) - 1;
-                if (!_settingsOptions.YoloMode && slippage < (Rational)_settingsOptions.SlippageTolerance)
-                {
-                    await SendPreFrontRunMessage($"⛔ Slippage ({(double)slippage:P}) too tight to front run", MessageTier.End);
-                    return;
-                }
-
-                // Prepare the front run message, and set with a higher gas price than the target swap.
-                var frontRunBuyMessage = new SwapExactEthForTokensFunction
-                {
-                    AmountToSend = frontRunAmountIn,
-                    AmountOutMin = (frontRunAmountOutMin * (Rational)0.999).WholePart,
-                    Path = swap.Path,
-                    To = _batBotOptions.FrontRunWalletAddress,
-                    Deadline = swap.Deadline,
-                    GasPrice = (swap.GasPrice.GetValueOrDefault() * (Rational)_settingsOptions.FrontRunGasPriceFactor).WholePart,
-                    Gas = swap.Gas
-                };
-
-                // Prepare the sell message for later selling the front run tokens that will be bought.
-                var frontRunSellMessage = new SwapExactTokensForEthFunction
-                {
-                    AmountOutMin = 0,
-                    Path = Enumerable.Reverse(frontRunBuyMessage.Path).ToList(),
-                    To = _batBotOptions.FrontRunWalletAddress,
-                    Deadline = DateTimeOffset.UtcNow.AddMinutes(20).ToUnixTimeSeconds()
-                };
-
-                #endregion
-
-                #region Prechecks
-
-                // Check that the front run swap will in fact succeed before front running.
-                if (await GetAmountOut(prepWeb3, frontRunBuyMessage.AmountToSend, frontRunBuyMessage.Path) < frontRunBuyMessage.AmountOutMin)
-                {
-                    await SendPreFrontRunMessage("‼️ Aborting (not front running) due to insufficient output amount on front run swap", MessageTier.End);
-                    return;
-                }
-
-                #endregion
-
-                try
-                {
                     #region Front run
 
                     if (!_settingsOptions.ShowDiscardedSwapsOutput)

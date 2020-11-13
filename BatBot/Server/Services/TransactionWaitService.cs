@@ -151,8 +151,11 @@ namespace BatBot.Server.Services
                         throw new ArgumentOutOfRangeException(nameof(transactionStatus), transactionStatus, null);
                 }
 
-                await _messagingServiceService.SendTxMessage($"{statusIcon} Found transaction {transactionHash}{(blockNumber.HasValue ? $" at {_messagingServiceService.GetEtherscanUrl($"block/{blockNumber}")}" : string.Empty)} (state: {EnumHelper.GetDescriptionFromValue(transactionStatus)})", MessageTier.End | MessageTier.Single);
-                _transactionStates.Add(transactionHash, state);
+                if (_transactionStates.TryAdd(transactionHash, state))
+                {
+                    await _messagingServiceService.SendTxMessage($"{statusIcon} Found transaction {transactionHash}{(blockNumber.HasValue ? $" at {_messagingServiceService.GetEtherscanUrl($"block/{blockNumber}")}" : string.Empty)} (state: {EnumHelper.GetDescriptionFromValue(transactionStatus)})");
+                }
+
                 ewh.Set();
             }
         }

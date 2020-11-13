@@ -34,10 +34,8 @@ namespace BatBot.Server.Services
             using var graphQLClient = new GraphQLHttpClient(_batBotOptions.UniswapSubgraphUrl, new SystemTextJsonSerializer());
 
             await _messagingService.SendLogMessage($"⚡ Sending Graph query '{typeof(T).GetCustomAttribute<DescriptionAttribute>()?.Description}' with variables '{variables}'");
-            return (await graphQLClient.SendQueryAsync<T>(new GraphQLRequest(BuildQuery<T>(), variables, operationName), cancellationToken)).Data;
+            return (await graphQLClient.SendQueryAsync<T>(new GraphQLRequest(BuildQuery(typeof(T), new List<(string, string)>()), variables, operationName), cancellationToken)).Data;
         }
-
-        public string BuildQuery<T>() => BuildQuery(typeof(T), new List<(string, string)>());
 
         private string BuildQuery(Type type, ICollection<(string Name, string TypeName)> variableTypes, bool isRoot = true)
         {

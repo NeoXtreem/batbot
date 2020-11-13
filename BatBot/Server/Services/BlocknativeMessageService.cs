@@ -32,49 +32,41 @@ namespace BatBot.Server.Services
                 var transactionHash = transaction.GetProperty(Blocknative.Properties.Hash).GetString();
                 _logger.LogTrace($"Transaction {transactionHash} received");
 
-                try
-                {
-                    //TODO: Remove containing try-catch if no other unknown statuses are ever encountered.
-                    var transactionStatus = EnumHelper.GetValueFromDescription<TransactionStatus>(transaction.GetProperty(Blocknative.Properties.Status).GetString());
+                var transactionStatus = EnumHelper.GetValueFromDescription<TransactionStatus>(transaction.GetProperty(Blocknative.Properties.Status).GetString());
 
-                    switch (transactionStatus)
-                    {
-                        case TransactionStatus.Pending:
-                            var @params = contractCall.GetProperty(Blocknative.Properties.Params);
-                            await _transactionProcessorService.Process(new Swap
-                            {
-                                TransactionHash = transactionHash,
-                                AmountToSend = TryParseJsonString(transaction, Blocknative.Properties.Value),
-                                Gas = transaction.GetProperty(Blocknative.Properties.Gas).GetUInt64(),
-                                GasPrice = TryParseJsonString(transaction, Blocknative.Properties.GasPrice),
-                                AmountOutMin = TryParseJsonString(@params, Blocknative.Properties.AmountOutMin),
-                                Deadline = (long)TryParseJsonString(@params, Blocknative.Properties.Deadline),
-                                Path = @params.GetProperty(Blocknative.Properties.Path).EnumerateArray().Select(e => e.GetString()).ToList(),
-                                Source = transactionSource
-                            }, cancellationToken);
-
-                            static BigInteger TryParseJsonString(JsonElement json, string name) => BigInteger.TryParse(json.GetProperty(name).GetString(), out var value)
-                                ? value
-                                : throw new ArgumentOutOfRangeException(nameof(json), json, null);
-                            break;
-                        case TransactionStatus.Cancel:
-                        case TransactionStatus.Confirmed:
-                        case TransactionStatus.Dropped:
-                        case TransactionStatus.Failed:
-                        case TransactionStatus.Stuck:
-                            var blockNumber = transaction.GetProperty(Blocknative.Properties.BlockNumber);
-                            await _transactionWaitService.TransactionReceived(transactionHash, blockNumber.ValueKind == JsonValueKind.Number ? blockNumber.GetInt64() : (BigInteger?)null, transactionStatus);
-                            break;
-                        case TransactionStatus.Speedup:
-                            // Ignore.
-                            break;
-                        default:
-                            throw new ArgumentOutOfRangeException(nameof(transaction), transaction, null);
-                    }
-                }
-                catch (Exception)
+                switch (transactionStatus)
                 {
-                    throw;
+                    case TransactionStatus.Pending:
+                        var @params = contractCall.GetProperty(Blocknative.Properties.Params);
+                        await _transactionProcessorService.Process(new Swap
+                        {
+                            TransactionHash = transactionHash,
+                            AmountToSend = TryParseJsonString(transaction, Blocknative.Properties.Value),
+                            Gas = transaction.GetProperty(Blocknative.Properties.Gas).GetUInt64(),
+                            GasPrice = TryParseJsonString(transaction, Blocknative.Properties.GasPrice),
+                            AmountOutMin = TryParseJsonString(@params, Blocknative.Properties.AmountOutMin),
+                            Deadline = (long)TryParseJsonString(@params, Blocknative.Properties.Deadline),
+                            Path = @params.GetProperty(Blocknative.Properties.Path).EnumerateArray().Select(e => e.GetString()).ToList(),
+                            Source = transactionSource
+                        }, cancellationToken);
+
+                        static BigInteger TryParseJsonString(JsonElement json, string name) => BigInteger.TryParse(json.GetProperty(name).GetString(), out var value)
+                            ? value
+                            : throw new ArgumentOutOfRangeException(nameof(json), json, null);
+                        break;
+                    case TransactionStatus.Cancel:
+                    case TransactionStatus.Confirmed:
+                    case TransactionStatus.Dropped:
+                    case TransactionStatus.Failed:
+                    case TransactionStatus.Stuck:
+                        var blockNumber = transaction.GetProperty(Blocknative.Properties.BlockNumber);
+                        await _transactionWaitService.TransactionReceived(transactionHash, blockNumber.ValueKind == JsonValueKind.Number ? blockNumber.GetInt64() : (BigInteger?)null, transactionStatus);
+                        break;
+                    case TransactionStatus.Speedup:
+                        // Ignore.
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(transaction), transaction, null);
                 }
             }
         }

@@ -81,7 +81,7 @@ namespace BatBot.Server.Services
             }
         }
 
-        async Task EstimateGas<T>(IWeb3 web3, string contractAddress, T functionMessage) where T : FunctionMessage, new()
+        private async Task EstimateGas<T>(IWeb3 web3, string contractAddress, T functionMessage) where T : FunctionMessage, new()
         {
             try
             {

@@ -41,7 +41,7 @@ namespace BatBot.Server.Services
 
             var treeLine = _messageTier switch
             {
-                MessageTier.End when nextMessageTier == MessageTier.Single => "┬─",
+                MessageTier.End when nextMessageTier == MessageTier.Single || nextMessageTier == (MessageTier.End | MessageTier.Single) => "┬─",
                 MessageTier.End when nextMessageTier == MessageTier.Double => "┬┬",
                 MessageTier.End when nextMessageTier == MessageTier.End => "──",
                 MessageTier.Double when nextMessageTier == MessageTier.Double => "│├─",
