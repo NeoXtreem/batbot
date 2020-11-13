@@ -7,6 +7,7 @@ using System.Numerics;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using BatBot.Server.Constants;
 using BatBot.Server.Dtos;
 using BatBot.Server.Extensions;
 using BatBot.Server.Functions;
@@ -94,6 +95,12 @@ namespace BatBot.Server.Services
                 {
                     var pairSwap = await GetPair(prepWeb3, (tokenIn.Id, tokenOut.Id));
                     var pairUsdt = await GetPair(prepWeb3, (tokenIn.Id, _batBotOptions.BaseTokenAddress));
+
+                    if (pairSwap is null)
+                    {
+                        await SendPreFrontRunMessage("⛔ Unable to obtain pair contract for this swap", MessageTier.End);
+                        return;
+                    }
 
                     // Check that the market cap of the output token is above a minimum amount to protect against possible scam coins.
                     var marketCap = pairUsdt.GetTokenPrice(_batBotOptions.BaseTokenAddress) * pairSwap.GetTokenPrice(tokenIn.Id) * tokenOut.TotalSupplyValue;
@@ -327,10 +334,7 @@ namespace BatBot.Server.Services
                         PairAddresses.Add(tokens, pairAddress);
                     }
 
-                    return (await SendQuery<PairResponse>(new
-                    {
-                        id = pairAddress
-                    })).Pair;
+                    return pairAddress != Uniswap.InvalidAddress ? (await SendQuery<PairResponse>(new {id = pairAddress})).Pair : null;
                 }
 
                 async Task SendPreFrontRunMessage(string message, MessageTier messageTier)
