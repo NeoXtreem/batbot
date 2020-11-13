@@ -1,23 +1,48 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 using BatBot.Server.Attributes;
+using BatBot.Server.Models;
+using GraphQL;
+using GraphQL.Client.Http;
+using GraphQL.Client.Serializer.SystemTextJson;
+using Microsoft.Extensions.Options;
 
-namespace BatBot.Server.Helpers
+namespace BatBot.Server.Services
 {
-    internal static class GraphQLHelper
+    public class GraphService
     {
-        private static readonly Dictionary<Type, string> Queries = new Dictionary<Type, string>();
+        private readonly BatBotOptions _batBotOptions;
+        private readonly MessagingService _messagingService;
 
-        public static string BuildQuery<T>() => BuildQuery(typeof(T), new List<(string, string)>());
+        private readonly Dictionary<Type, string> _queries = new Dictionary<Type, string>();
 
-        private static string BuildQuery(Type type, ICollection<(string Name, string TypeName)> variableTypes, bool isRoot = true)
+        public GraphService(IOptionsFactory<BatBotOptions> batBotOptionsFactory, MessagingService messagingService)
+        {
+            _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
+            _messagingService = messagingService;
+        }
+
+        public async Task<T> SendQuery<T>(object variables = null, string operationName = null, CancellationToken cancellationToken = default)
+        {
+            using var graphQLClient = new GraphQLHttpClient(_batBotOptions.UniswapSubgraphUrl, new SystemTextJsonSerializer());
+
+            await _messagingService.SendLogMessage($"⚡ Sending Graph query '{typeof(T).GetCustomAttribute<DescriptionAttribute>()?.Description}' with variables '{variables}'");
+            return (await graphQLClient.SendQueryAsync<T>(new GraphQLRequest(BuildQuery<T>(), variables, operationName), cancellationToken)).Data;
+        }
+
+        public string BuildQuery<T>() => BuildQuery(typeof(T), new List<(string, string)>());
+
+        private string BuildQuery(Type type, ICollection<(string Name, string TypeName)> variableTypes, bool isRoot = true)
         {
             // Cache previous queries in a dictionary for quicker access.
-            if (isRoot && Queries.TryGetValue(type, out var query)) return query;
+            if (isRoot && _queries.TryGetValue(type, out var query)) return query;
 
             var properties = type.GetProperties().Where(p => p.GetCustomAttribute<JsonPropertyNameAttribute>() != null).ToArray();
             if (!properties.Any()) return string.Empty;
@@ -51,7 +76,7 @@ namespace BatBot.Server.Helpers
 
             if (isRoot)
             {
-                Queries.Add(type, query);
+                _queries.Add(type, query);
             }
 
             return query;

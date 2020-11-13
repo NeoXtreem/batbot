@@ -1,5 +1,4 @@
 ﻿using System.ComponentModel;
-using System.Numerics;
 using System.Text.Json.Serialization;
 using BatBot.Server.Attributes;
 
@@ -24,10 +23,6 @@ namespace BatBot.Server.Models.Graph
 
             [JsonPropertyName("totalSupply")]
             public string TotalSupply { get; set; }
-
-            public int DecimalsValue => int.Parse(Decimals);
-
-            public BigInteger TotalSupplyValue => BigInteger.Parse(TotalSupply);
         }
     }
 }

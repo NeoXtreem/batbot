@@ -1,26 +1,18 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.Linq;
 using System.Numerics;
-using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using BatBot.Server.Constants;
 using BatBot.Server.Dtos;
 using BatBot.Server.Extensions;
 using BatBot.Server.Functions;
-using BatBot.Server.Helpers;
 using BatBot.Server.Models;
 using BatBot.Server.Models.Graph;
 using BatBot.Server.Types;
-using GraphQL;
-using GraphQL.Client.Http;
-using GraphQL.Client.Serializer.SystemTextJson;
 using Microsoft.Extensions.Options;
 using Nethereum.ABI.FunctionEncoding;
-using Nethereum.ABI.FunctionEncoding.Attributes;
 using Nethereum.Contracts;
 using Nethereum.JsonRpc.Client;
 using Nethereum.RPC.Eth.DTOs;
@@ -38,17 +30,30 @@ namespace BatBot.Server.Services
         private readonly SettingsOptions _settingsOptions;
         private readonly MessagingService _messagingService;
         private readonly BackoffService _backoffService;
+        private readonly BlockchainService _blockchainService;
+        private readonly GraphService _graphService;
+        private readonly TokenInfoService _tokenInfoService;
         private readonly TransactionWaitService _transactionWaitService;
 
         private static string _factoryAddress;
         private static readonly Dictionary<(string, string), string> PairAddresses = new Dictionary<(string, string), string>();
 
-        public TransactionProcessorService(IOptionsFactory<BatBotOptions> batBotOptionsFactory, IOptionsFactory<SettingsOptions> settingsOptionsFactory, MessagingService messagingService, BackoffService backoffService, TransactionWaitService transactionWaitService)
+        public TransactionProcessorService(
+            IOptionsFactory<BatBotOptions> batBotOptionsFactory,
+            IOptionsFactory<SettingsOptions> settingsOptionsFactory,
+            MessagingService messagingService,
+            BackoffService backoffService, BlockchainService blockchainService,
+            GraphService graphService,
+            TokenInfoService tokenInfoService,
+            TransactionWaitService transactionWaitService)
         {
             _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
             _settingsOptions = settingsOptionsFactory.Create(Options.DefaultName);
             _messagingService = messagingService;
             _backoffService = backoffService;
+            _blockchainService = blockchainService;
+            _graphService = graphService;
+            _tokenInfoService = tokenInfoService;
             _transactionWaitService = transactionWaitService;
         }
 
@@ -64,12 +69,10 @@ namespace BatBot.Server.Services
                 var detectedMessage = $"🔎 Detected transaction: {_messagingService.GetEtherscanUrl($"tx/{swap.TransactionHash}")}";
                 await SendPreFrontRunMessage(detectedMessage, MessageTier.Double);
 
-                var graphQLClient = new GraphQLHttpClient(_batBotOptions.UniswapSubgraphUrl, new SystemTextJsonSerializer());
+                var tokenIn = await _tokenInfoService.GetToken(prepWeb3, swap.Path.First(), cancellationToken);
+                var tokenOut = await _tokenInfoService.GetToken(prepWeb3, swap.Path.Last(), cancellationToken);
 
-                var tokenIn = (await SendQuery<TokenResponse>(new {id = swap.Path.First().ToLowerInvariant()})).Token;
-                var tokenOut = (await SendQuery<TokenResponse>(new {id = swap.Path.Last().ToLowerInvariant()})).Token;
-
-                var swapMessage = $"💱 Swap {Web3.Convert.FromWei(swap.AmountToSend)} {tokenIn.Symbol} for {Web3.Convert.FromWei(swap.AmountOutMin, tokenOut.DecimalsValue)} {tokenOut.Symbol} with gas price {Web3.Convert.FromWei(swap.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} Gwei";
+                var swapMessage = $"💱 Swap {Web3.Convert.FromWei(swap.AmountToSend)} {tokenIn.Symbol} for {Web3.Convert.FromWei(swap.AmountOutMin, tokenOut.Decimals)} {tokenOut.Symbol} with gas price {Web3.Convert.FromWei(swap.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} Gwei";
                 await SendPreFrontRunMessage(swapMessage, MessageTier.End | MessageTier.Single);
 
                 #region Validation
@@ -88,13 +91,13 @@ namespace BatBot.Server.Services
                     return;
                 }
 
-                _factoryAddress ??= await ContractQuery<FactoryFunction, string>(prepWeb3, _batBotOptions.ContractAddress);
+                _factoryAddress ??= await _blockchainService.ContractQuery<FactoryFunction, string>(prepWeb3, _batBotOptions.ContractAddress);
 
                 // No need to perform the following check on a testnet.
                 if (_batBotOptions.Network == BatBotOptions.Mainnet)
                 {
-                    var pairSwap = await GetPair(prepWeb3, (tokenIn.Id, tokenOut.Id));
-                    var pairUsdt = await GetPair(prepWeb3, (tokenIn.Id, _batBotOptions.BaseTokenAddress));
+                    var pairSwap = await GetPair(prepWeb3, (tokenIn.Address, tokenOut.Address));
+                    var pairUsdt = await GetPair(prepWeb3, (tokenIn.Address, _batBotOptions.BaseTokenAddress));
 
                     if (pairSwap is null)
                     {
@@ -103,7 +106,7 @@ namespace BatBot.Server.Services
                     }
 
                     // Check that the market cap of the output token is above a minimum amount to protect against possible scam coins.
-                    var marketCap = pairUsdt.GetTokenPrice(_batBotOptions.BaseTokenAddress) * pairSwap.GetTokenPrice(tokenIn.Id) * tokenOut.TotalSupplyValue;
+                    var marketCap = pairUsdt.GetTokenPrice(_batBotOptions.BaseTokenAddress) * pairSwap.GetTokenPrice(tokenIn.Address) * tokenOut.TotalSupply;
 
                     if (marketCap < (Rational)_settingsOptions.MinimumMarketCap)
                     {
@@ -135,8 +138,6 @@ namespace BatBot.Server.Services
 
                     var frontRunAmountInMin = Web3.Convert.ToWei(_settingsOptions.MinimumFrontRunEth);
                     var frontRunAmountInMax = Web3.Convert.ToWei(_settingsOptions.MaximumFrontRunEth);
-
-                    if (frontRunAmountIn == frontRunAmountInMax) break;
 
                     var targetSwapAmountOutAboveMin = targetSwapAmountOut > (swap.AmountOutMin * (Rational)(1 + _settingsOptions.TargetSwapAmountOutToleranceMin)).WholePart;
                     var targetSwapAmountOutBelowMax = targetSwapAmountOut < (swap.AmountOutMin * (Rational)(1 + _settingsOptions.TargetSwapAmountOutToleranceMax)).WholePart;
@@ -225,7 +226,7 @@ namespace BatBot.Server.Services
 
                     // Now attempt to front run the target swap with a faster swap.
                     await _messagingService.SendTxMessage($"🏃 Front running {Web3.Convert.FromWei(frontRunBuyMessage.AmountToSend)} {tokenIn.Symbol} with gas price {Web3.Convert.FromWei(frontRunBuyMessage.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} gwei", MessageTier.Double);
-                    var frontRunBuyReceipt = await ContractSendRequestAndWaitForReceipt(frontRunWeb3, _batBotOptions.ContractAddress, frontRunBuyMessage, false);
+                    var frontRunBuyReceipt = await _blockchainService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, _batBotOptions.ContractAddress, frontRunBuyMessage, false);
                     await _messagingService.SendTxMessage($"#️⃣ Front run transaction: {_messagingService.GetEtherscanUrl($"tx/{frontRunBuyReceipt.TransactionHash}")}");
 
                     if (frontRunBuyReceipt.Failed())
@@ -238,9 +239,11 @@ namespace BatBot.Server.Services
                     var frontRunSwapEvent = frontRunBuyReceipt.DecodeAllEvents<SwapEventDTO>().Last().Event;
                     var amountBought = frontRunSwapEvent.Amount0In == frontRunBuyMessage.AmountToSend ? frontRunSwapEvent.Amount1Out : frontRunSwapEvent.Amount0Out;
 
-                    await _messagingService.SendTxMessage($"✅ Successfully bought {Web3.Convert.FromWei(amountBought, tokenOut.DecimalsValue)} {tokenOut.Symbol}", MessageTier.End | MessageTier.Single);
+                    await _messagingService.SendTxMessage($"✅ Successfully bought {Web3.Convert.FromWei(amountBought, tokenOut.Decimals)} {tokenOut.Symbol}", MessageTier.End | MessageTier.Single);
 
                     #endregion
+
+                    #region Pre-sell
 
                     // Wait for original (target's) swap to be mined.
                     if (!await _transactionWaitService.WaitForTransaction(swap.TransactionHash, swap.Source, cancellationToken) && !_settingsOptions.SellOnFailedTargetSwap)
@@ -249,17 +252,9 @@ namespace BatBot.Server.Services
                         return;
                     }
 
-                    #region Sell
-
-                    frontRunSellMessage.AmountIn = amountBought;
-                    await _messagingService.SendTxMessage($"🛒 Selling {Web3.Convert.FromWei(frontRunSellMessage.AmountIn, tokenOut.DecimalsValue)} {tokenOut.Symbol}", MessageTier.Double);
-                    TransactionReceipt frontRunSellReceipt;
-
-                    #region Spender approval
-
                     // Ensure that the tokens bought are approved for selling before purchasing.
                     await _messagingService.SendTxMessage($"❓ Checking spender {_batBotOptions.ContractAddress} allowed");
-                    var allowed = await ContractQuery<AllowanceFunction, BigInteger>(frontRunWeb3, frontRunSellMessage.Path.First(), new AllowanceFunction
+                    var allowed = await _blockchainService.ContractQuery<AllowanceFunction, BigInteger>(frontRunWeb3, frontRunSellMessage.Path.First(), new AllowanceFunction
                     {
                         Owner = _batBotOptions.FrontRunWalletAddress,
                         Spender = _batBotOptions.ContractAddress
@@ -268,7 +263,7 @@ namespace BatBot.Server.Services
                     if (allowed.IsZero)
                     {
                         await _messagingService.SendTxMessage($"🤝 Approving spender {_batBotOptions.ContractAddress}");
-                        var approveReceipt = await ContractSendRequestAndWaitForReceipt(frontRunWeb3, frontRunSellMessage.Path.First(), new ApproveFunction
+                        var approveReceipt = await _blockchainService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, frontRunSellMessage.Path.First(), new ApproveFunction
                         {
                             Spender = _batBotOptions.ContractAddress,
                             Value = (BigInteger.One << 256) - 1
@@ -283,10 +278,16 @@ namespace BatBot.Server.Services
 
                     #endregion
 
+                    #region Sell
+
+                    frontRunSellMessage.AmountIn = amountBought;
+                    await _messagingService.SendTxMessage($"🛒 Selling {Web3.Convert.FromWei(frontRunSellMessage.AmountIn, tokenOut.Decimals)} {tokenOut.Symbol}", MessageTier.Double);
+                    TransactionReceipt frontRunSellReceipt;
+
                     try
                     {
                         // Sell the front run tokens bought earlier.
-                        frontRunSellReceipt = await ContractSendRequestAndWaitForReceipt(frontRunWeb3, _batBotOptions.ContractAddress, frontRunSellMessage);
+                        frontRunSellReceipt = await _blockchainService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, _batBotOptions.ContractAddress, frontRunSellMessage);
                     }
                     catch (SmartContractRevertException e)
                     {
@@ -320,21 +321,15 @@ namespace BatBot.Server.Services
 
                 #region Local functions
 
-                async Task<T> SendQuery<T>(object variables = null, string operationName = null)
-                {
-                    await _messagingService.SendLogMessage($"⚡ Sending Graph query '{typeof(T).GetCustomAttribute<DescriptionAttribute>()?.Description}' with variables '{variables}'");
-                    return (await graphQLClient.SendQueryAsync<T>(new GraphQLRequest(GraphQLHelper.BuildQuery<T>(), variables, operationName), cancellationToken)).Data;
-                }
-
                 async Task<PairResponse.PairType> GetPair(IWeb3 web3, (string TokenA, string TokenB) tokens)
                 {
                     if (!PairAddresses.TryGetValue(tokens, out var pairAddress))
                     {
-                        pairAddress = (await ContractQuery<GetPairFunction, string>(web3, _factoryAddress, new GetPairFunction {TokenA = tokens.TokenA, TokenB = tokens.TokenB})).ToLowerInvariant();
+                        pairAddress = (await _blockchainService.ContractQuery<GetPairFunction, string>(web3, _factoryAddress, new GetPairFunction {TokenA = tokens.TokenA, TokenB = tokens.TokenB})).ToLowerInvariant();
                         PairAddresses.Add(tokens, pairAddress);
                     }
 
-                    return pairAddress != Uniswap.InvalidAddress ? (await SendQuery<PairResponse>(new {id = pairAddress})).Pair : null;
+                    return pairAddress != Uniswap.InvalidAddress ? (await _graphService.SendQuery<PairResponse>(new {id = pairAddress}, cancellationToken: cancellationToken)).Pair : null;
                 }
 
                 async Task SendPreFrontRunMessage(string message, MessageTier messageTier)
@@ -349,7 +344,7 @@ namespace BatBot.Server.Services
                     }
                 }
 
-                async Task<BigInteger> GetAmountOut(IWeb3 web3, BigInteger amountIn, List<string> path) => (await ContractQuery<GetAmountsOutFunction, List<BigInteger>>(web3, _batBotOptions.ContractAddress, new GetAmountsOutFunction
+                async Task<BigInteger> GetAmountOut(IWeb3 web3, BigInteger amountIn, List<string> path) => (await _blockchainService.ContractQuery<GetAmountsOutFunction, List<BigInteger>>(web3, _batBotOptions.ContractAddress, new GetAmountsOutFunction
                 {
                     AmountIn = amountIn,
                     Path = path
@@ -360,79 +355,6 @@ namespace BatBot.Server.Services
                     var balance = Web3.Convert.FromWei(await web3.Eth.GetBalance.SendRequestAsync(_batBotOptions.FrontRunWalletAddress));
                     await _messagingService.SendTxMessage($"💰 Current ETH balance: {balance}");
                     return balance;
-                }
-
-                async Task<T2> ContractQuery<T1, T2>(IWeb3 web3, string contractAddress, T1 functionMessage = null) where T1 : FunctionMessage, new()
-                {
-                    var result = await web3.Eth.GetContractQueryHandler<T1>().QueryAsync<T2>(contractAddress, functionMessage);
-                    await _messagingService.SendLogMessage($"⚡ Executed '{typeof(T1).GetCustomAttribute<FunctionAttribute>()?.Name}' at {_messagingService.GetEtherscanUrl($"contract/{contractAddress}")} with result {(result is IEnumerable enumerable && !(result is string) ? string.Join(",", enumerable.Cast<object>()) : result.ToString())}");
-                    return result;
-                }
-
-                async Task<TransactionReceipt> ContractSendRequestAndWaitForReceipt<T>(IWeb3 web3, string contractAddress, T functionMessage, bool escalateGas = true) where T : FunctionMessage, new()
-                {
-                    var handler = web3.Eth.GetContractTransactionHandler<T>();
-
-                    if (escalateGas)
-                    {
-                        await EstimateGas(web3, contractAddress, functionMessage);
-                        IncreaseGas(); // Give the gas a boost upfront as it tends to fail with the estimated gas.
-
-                        for (var i = 0; i < _settingsOptions.GasEscalationRetries; i++)
-                        {
-                            try
-                            {
-                                var transactionReceipt = await SendRequestAndWaitForReceiptAsync();
-                                if (transactionReceipt.Failed())
-                                {
-                                    await _messagingService.SendTxMessage("❌ Failed - increasing gas limit and trying again");
-                                    IncreaseGas();
-                                    continue;
-                                }
-
-                                return transactionReceipt;
-                            }
-                            catch (RpcResponseException e)
-                            {
-                                if (e.Message.Contains("gas allowance"))
-                                {
-                                    await _messagingService.SendTxMessage($"❌ Failed with error '{e.Message}' - increasing gas limit and trying again");
-                                    IncreaseGas();
-                                }
-                                else
-                                {
-                                    throw;
-                                }
-                            }
-                        }
-
-                        void IncreaseGas() => functionMessage.Gas = (functionMessage.Gas.GetValueOrDefault() * (Rational)_settingsOptions.GasEscalationFactor).WholePart;
-                    }
-
-                    return await SendRequestAndWaitForReceiptAsync();
-
-                    async Task<TransactionReceipt> SendRequestAndWaitForReceiptAsync()
-                    {
-                        await _messagingService.SendTxMessage($"⚡ Executing '{typeof(T).GetCustomAttribute<FunctionAttribute>()?.Name}' at {_messagingService.GetEtherscanUrl($"contract/{contractAddress}")} with gas limit {(functionMessage.Gas.HasValue ? functionMessage.Gas.ToString() : "unset")}");
-                        return await handler.SendRequestAndWaitForReceiptAsync(contractAddress, functionMessage);
-                    }
-                }
-
-                async Task EstimateGas<T>(IWeb3 web3, string contractAddress, T functionMessage) where T : FunctionMessage, new()
-                {
-                    try
-                    {
-                        //TODO: Convert to ??= operator when this issue is fixed: https://github.com/dotnet/roslyn/issues/49148
-                        if (functionMessage.Gas is null)
-                        {
-                            functionMessage.Gas = await web3.Eth.GetContractTransactionHandler<T>().EstimateGasAsync(contractAddress, functionMessage);
-                        }
-                    }
-                    catch (SmartContractRevertException e)
-                    {
-                        await _messagingService.SendTxMessage($"❌ Gas estimation for '{typeof(T).GetCustomAttribute<FunctionAttribute>()?.Name}' failed with {e.Message}");
-                        throw;
-                    }
                 }
 
                 #endregion
