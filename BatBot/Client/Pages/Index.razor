@@ -1,0 +1,103 @@
+﻿@page "/"
+@using Microsoft.AspNetCore.SignalR.Client
+@using BatBot.Shared
+@inject HttpClient Http
+@inject NavigationManager NavigationManager
+@implements IDisposable
+
+<h1>Hit the Gas, BatBot!</h1>
+
+<button @onclick="@MonitorMempool" type="button" class="btn btn-primary">
+    Monitor Mempool ➝
+</button>
+
+<button @onclick="@MonitorBlocknativeWebhook" type="button" class="btn btn-primary">
+    Monitor Blocknative Webhook ➝
+</button>
+
+<button @onclick="@MonitorBlocknativeWebSocket" type="button" class="btn btn-primary">
+    Monitor Blocknative WebSocket ➝
+</button>
+
+<table class="table-active" style="max-height:500px">
+    <thead>
+        <tr>
+            <th>Timestamp</th>
+            <th>Transaction</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach (var message in _txMessages.TakeLast(30))
+        {
+            <tr>
+                <td>@message.Timestamp</td>
+                <td>@message.Text</td>
+            </tr>
+        }
+    </tbody>
+</table>
+
+<table class="table-active">
+    <thead>
+    <tr>
+        <th>Timestamp</th>
+        <th>Log</th>
+    </tr>
+    </thead>
+    <tbody>
+        @foreach (var message in _logMessages.TakeLast(10))
+        {
+            <tr>
+                <td>@message.Timestamp</td>
+                <td>@message.Text</td>
+            </tr>
+        }
+    </tbody>
+</table>
+
+@code {
+    private HubConnection _hubConnection;
+    private readonly List<Message> _txMessages = new List<Message>();
+    private readonly List<Message> _logMessages = new List<Message>();
+
+    protected override async Task OnInitializedAsync()
+    {
+        _hubConnection = new HubConnectionBuilder()
+            .WithUrl(NavigationManager.ToAbsoluteUri("/messageHub"))
+            .Build();
+
+        _hubConnection.On<Message>("ReceiveTxMessage", m =>
+        {
+            _txMessages.Add(m);
+            StateHasChanged();
+        });
+
+        _hubConnection.On<Message>("ReceiveLogMessage", m =>
+        {
+            _logMessages.Add(m);
+            StateHasChanged();
+        });
+
+        await _hubConnection.StartAsync();
+    }
+
+    public async Task MonitorMempool()
+    {
+        var response = await Http.PostAsync("BatBot/MonitorMempool", null);
+    }
+
+    public async Task MonitorBlocknativeWebhook()
+    {
+        var response = await Http.PostAsync("BatBot/MonitorBlocknativeWebhook", null);
+    }
+
+    public async Task MonitorBlocknativeWebSocket()
+    {
+        var response = await Http.PostAsync("BatBot/MonitorBlocknativeWebSocket", null);
+    }
+
+    public void Dispose()
+    {
+        _ = _hubConnection?.DisposeAsync();
+    }
+}
