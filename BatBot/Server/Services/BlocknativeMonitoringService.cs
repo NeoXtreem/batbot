@@ -119,31 +119,36 @@ namespace BatBot.Server.Services
                         new Dictionary<string, object>
                         {
                             {
-                                Blocknative.Properties.Value,
-                                new Dictionary<string, object> {{Blocknative.Filters.Gte, Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth)}}
-                            }
-                        },
-                        new Dictionary<string, object>
-                        {
-                            {
-                                Blocknative.Properties.Value, new Dictionary<string, object> {{Blocknative.Filters.Lte, Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)}}
-                            }
-                        },
-                        new Dictionary<string, object>
-                        {
-                            {
                                 $"{Blocknative.Properties.ContractCall}.{Blocknative.Properties.MethodName}", Uniswap.SwapExactEthForTokens
-                            }
-                        },
-                        new Dictionary<string, object>
-                        {
-                            {
-                                Blocknative.Properties.GasPrice, new Dictionary<string, object> {{Blocknative.Filters.Lte, Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei)}}
                             }
                         }
                     },
                     Scope = _batBotOptions.ContractAddress
                 };
+
+                if (!_settingsOptions.YoloMode)
+                {
+                    configMessage.Config.Filters.Add(new Dictionary<string, object>
+                    {
+                        {
+                            Blocknative.Properties.Value, new Dictionary<string, object> {{Blocknative.Filters.Gte, Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth)}}
+                        }
+                    });
+
+                    configMessage.Config.Filters.Add(new Dictionary<string, object>
+                    {
+                        {
+                            Blocknative.Properties.Value, new Dictionary<string, object> {{Blocknative.Filters.Lte, Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)}}
+                        }
+                    });
+
+                    configMessage.Config.Filters.Add(new Dictionary<string, object>
+                    {
+                        {
+                            Blocknative.Properties.GasPrice, new Dictionary<string, object> {{Blocknative.Filters.Lte, Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei)}}
+                        }
+                    });
+                }
 
                 return configMessage;
             }

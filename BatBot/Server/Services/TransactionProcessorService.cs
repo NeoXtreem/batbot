@@ -64,6 +64,8 @@ namespace BatBot.Server.Services
 
             await _backoffService.Throttle(async () =>
             {
+                _transactionWaitService.AddTransaction(swap.TransactionHash);
+
                 var prepWeb3 = new Web3(new Account(_batBotOptions.PrepPrivateKey), _batBotOptions.BlockchainEndpointHttpUrl);
 
                 var detectedMessage = $"🔎 Detected transaction: {_messagingService.GetEtherscanUrl($"tx/{swap.TransactionHash}")}";
@@ -77,48 +79,51 @@ namespace BatBot.Server.Services
 
                 #region Validation
 
-                // Ignore transactions that are outside of the configured range.
-                if (!swap.AmountToSend.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)))
+                if (!_settingsOptions.YoloMode)
                 {
-                    await SendPreFrontRunMessage("⛔ Amount to send outside of the configured range", MessageTier.End);
-                    return;
-                }
-
-                // Ignore transactions with too high gas price.
-                if (swap.GasPrice > Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei))
-                {
-                    await SendPreFrontRunMessage("⛔ Gas price higher than the configured limit", MessageTier.End);
-                    return;
-                }
-
-                _factoryAddress ??= await _blockchainService.ContractQuery<FactoryFunction, string>(prepWeb3, _batBotOptions.ContractAddress);
-
-                // No need to perform the following check on a testnet.
-                if (_batBotOptions.Network == BatBotOptions.Mainnet)
-                {
-                    var pairSwap = await GetPair(prepWeb3, (tokenIn.Address, tokenOut.Address));
-                    var pairUsdt = await GetPair(prepWeb3, (tokenIn.Address, _batBotOptions.BaseTokenAddress));
-
-                    if (pairSwap is null)
+                    // Ignore transactions that are outside of the configured range.
+                    if (!swap.AmountToSend.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)))
                     {
-                        await SendPreFrontRunMessage("⛔ Unable to obtain pair contract for this swap", MessageTier.End);
+                        await SendPreFrontRunMessage("⛔ Amount to send outside of the configured range", MessageTier.End);
                         return;
                     }
 
-                    // Check that the market cap of the output token is above a minimum amount to protect against possible scam coins.
-                    var marketCap = pairUsdt.GetTokenPrice(_batBotOptions.BaseTokenAddress) * pairSwap.GetTokenPrice(tokenIn.Address) * tokenOut.TotalSupply;
-
-                    if (marketCap < (Rational)_settingsOptions.MinimumMarketCap)
+                    // Ignore transactions with too high gas price.
+                    if (swap.GasPrice > Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei))
                     {
-                        await SendPreFrontRunMessage($"⛔ Market cap (${marketCap.WholePart}) too low", MessageTier.End);
+                        await SendPreFrontRunMessage("⛔ Gas price higher than the configured limit", MessageTier.End);
                         return;
                     }
 
-                    // Check that the pair contract wasn't created too recently to protect against possible scam coins.
-                    if (pairSwap.CreatedValue > DateTime.UtcNow.AddDays(_settingsOptions.MinimumPairContractAge))
+                    _factoryAddress ??= await _blockchainService.ContractQuery<FactoryFunction, string>(prepWeb3, _batBotOptions.ContractAddress);
+
+                    // No need to perform the following check on a testnet.
+                    if (_batBotOptions.Network == BatBotOptions.Mainnet)
                     {
-                        await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pairSwap.CreatedValue:g})", MessageTier.End);
-                        return;
+                        var pairSwap = await GetPair(prepWeb3, (tokenIn.Address, tokenOut.Address));
+                        var pairUsdt = await GetPair(prepWeb3, (tokenIn.Address, _batBotOptions.BaseTokenAddress));
+
+                        if (pairSwap is null)
+                        {
+                            await SendPreFrontRunMessage("⛔ Unable to obtain pair contract for this swap", MessageTier.End);
+                            return;
+                        }
+
+                        // Check that the market cap of the output token is above a minimum amount to protect against possible scam coins.
+                        var marketCap = pairUsdt.GetTokenPrice(_batBotOptions.BaseTokenAddress) * pairSwap.GetTokenPrice(tokenIn.Address) * tokenOut.TotalSupply;
+
+                        if (marketCap < (Rational)_settingsOptions.MinimumMarketCap)
+                        {
+                            await SendPreFrontRunMessage($"⛔ Market cap (${marketCap.WholePart}) too low", MessageTier.End);
+                            return;
+                        }
+
+                        // Check that the pair contract wasn't created too recently to protect against possible scam coins.
+                        if (pairSwap.CreatedValue > DateTime.UtcNow.AddDays(_settingsOptions.MinimumPairContractAge))
+                        {
+                            await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pairSwap.CreatedValue:g})", MessageTier.End);
+                            return;
+                        }
                     }
                 }
 
@@ -138,6 +143,8 @@ namespace BatBot.Server.Services
 
                     var frontRunAmountInMin = Web3.Convert.ToWei(_settingsOptions.MinimumFrontRunEth);
                     var frontRunAmountInMax = Web3.Convert.ToWei(_settingsOptions.MaximumFrontRunEth);
+
+                    if (_settingsOptions.YoloMode) break;
 
                     var targetSwapAmountOutAboveMin = targetSwapAmountOut > (swap.AmountOutMin * (Rational)(1 + _settingsOptions.TargetSwapAmountOutToleranceMin)).WholePart;
                     var targetSwapAmountOutBelowMax = targetSwapAmountOut < (swap.AmountOutMin * (Rational)(1 + _settingsOptions.TargetSwapAmountOutToleranceMax)).WholePart;
@@ -161,7 +168,7 @@ namespace BatBot.Server.Services
 
                 // Calculate the slippage as the difference between the amounts out and amounts in ratios, then compare to the tolerance.
                 var slippage = new Rational(frontRunAmountOutMin) / new Rational(targetSwapAmountOut) / (new Rational(frontRunAmountIn) / new Rational(swap.AmountToSend)) - 1;
-                if (slippage < (Rational)_settingsOptions.SlippageTolerance)
+                if (!_settingsOptions.YoloMode && slippage < (Rational)_settingsOptions.SlippageTolerance)
                 {
                     await SendPreFrontRunMessage($"⛔ Slippage ({(double)slippage:P}) too tight to front run", MessageTier.End);
                     return;
@@ -191,14 +198,6 @@ namespace BatBot.Server.Services
                 #endregion
 
                 #region Prechecks
-
-                // Check that the target swap will in fact succeed before front running.
-                var targetSwapActualAmountOut = await GetAmountOut(prepWeb3, swap.AmountToSend, swap.Path);
-                if (targetSwapActualAmountOut < swap.AmountOutMin)
-                {
-                    await SendPreFrontRunMessage("‼️ Aborting (not front running) due to insufficient output amount on target swap", MessageTier.End);
-                    return;
-                }
 
                 // Check that the front run swap will in fact succeed before front running.
                 if (await GetAmountOut(prepWeb3, frontRunBuyMessage.AmountToSend, frontRunBuyMessage.Path) < frontRunBuyMessage.AmountOutMin)
@@ -245,36 +244,48 @@ namespace BatBot.Server.Services
 
                     #region Pre-sell
 
-                    // Wait for original (target's) swap to be mined.
-                    if (!await _transactionWaitService.WaitForTransaction(swap.TransactionHash, swap.Source, cancellationToken) && !_settingsOptions.SellOnFailedTargetSwap)
+                    var waitTask = Task.Run(async () =>
                     {
-                        await _messagingService.SendTxMessage("‼️ Aborting (not selling) due to target swap failing (as configured)", MessageTier.End);
-                        return;
-                    }
-
-                    // Ensure that the tokens bought are approved for selling before purchasing.
-                    await _messagingService.SendTxMessage($"❓ Checking spender {_batBotOptions.ContractAddress} allowed");
-                    var allowed = await _blockchainService.ContractQuery<AllowanceFunction, BigInteger>(frontRunWeb3, frontRunSellMessage.Path.First(), new AllowanceFunction
-                    {
-                        Owner = _batBotOptions.FrontRunWalletAddress,
-                        Spender = _batBotOptions.ContractAddress
-                    });
-
-                    if (allowed.IsZero)
-                    {
-                        await _messagingService.SendTxMessage($"🤝 Approving spender {_batBotOptions.ContractAddress}");
-                        var approveReceipt = await _blockchainService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, frontRunSellMessage.Path.First(), new ApproveFunction
+                        // Wait for original (target's) swap to be mined.
+                        if (!_transactionWaitService.WaitForTransaction(swap.TransactionHash, swap.Source, cancellationToken).Result && !_settingsOptions.SellOnFailedTargetSwap)
                         {
-                            Spender = _batBotOptions.ContractAddress,
-                            Value = (BigInteger.One << 256) - 1
+                            await _messagingService.SendTxMessage("‼️ Aborting (not selling) due to target swap failing (as configured)", MessageTier.End);
+                            return false;
+                        }
+
+                        return true;
+                    }, cancellationToken);
+
+                    var approveTask = Task.Run(async () =>
+                    {
+                        // Ensure that the tokens bought are approved for selling before purchasing.
+                        await _messagingService.SendTxMessage($"❓ Checking spender {_batBotOptions.ContractAddress} allowed");
+                        var allowed = await _blockchainService.ContractQuery<AllowanceFunction, BigInteger>(frontRunWeb3, frontRunSellMessage.Path.First(), new AllowanceFunction
+                        {
+                            Owner = _batBotOptions.FrontRunWalletAddress,
+                            Spender = _batBotOptions.ContractAddress
                         });
 
-                        if (approveReceipt.Failed())
+                        if (allowed.IsZero)
                         {
-                            await _messagingService.SendTxMessage("❌ Failed", MessageTier.End);
-                            return;
+                            await _messagingService.SendTxMessage($"🤝 Approving spender {_batBotOptions.ContractAddress}");
+                            var approveReceipt = await _blockchainService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, frontRunSellMessage.Path.First(), new ApproveFunction
+                            {
+                                Spender = _batBotOptions.ContractAddress,
+                                Value = (BigInteger.One << 256) - 1
+                            });
+
+                            if (approveReceipt.Failed())
+                            {
+                                await _messagingService.SendTxMessage("❌ Failed", MessageTier.End);
+                                return false;
+                            }
                         }
-                    }
+
+                        return true;
+                    }, cancellationToken);
+
+                    if ((await Task.WhenAll(approveTask, waitTask)).Any(r => !r)) return;
 
                     #endregion
 

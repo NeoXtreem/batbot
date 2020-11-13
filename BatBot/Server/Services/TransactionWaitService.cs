@@ -36,6 +36,12 @@ namespace BatBot.Server.Services
             _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
         }
 
+        public void AddTransaction(string transactionHash)
+        {
+            // Create a wait handle to block execution until a state change is detected in the transaction.
+            _waitHandles.Add(transactionHash, new EventWaitHandle(false, EventResetMode.ManualReset, transactionHash));
+        }
+
         public async Task<bool> WaitForTransaction(string transactionHash, TransactionSource transactionSource, CancellationToken cancellationToken)
         {
             await _messagingServiceService.SendTxMessage($"⏳ Waiting for transaction: {_messagingServiceService.GetEtherscanUrl($"tx/{transactionHash}")}", MessageTier.Double);
@@ -84,10 +90,6 @@ namespace BatBot.Server.Services
                 case TransactionSource.BlocknativeWebhook:
                 case TransactionSource.BlocknativeWebSocket:
                 {
-                    // Create a wait handle to block execution until a state change is detected in the transaction.
-                    var ewh = new EventWaitHandle(false, EventResetMode.ManualReset, transactionHash);
-                    _waitHandles.Add(transactionHash, ewh);
-
                     if (transactionSource == TransactionSource.BlocknativeWebhook)
                     {
                         // Watch for the transaction state changing via Blocknative.
@@ -108,7 +110,11 @@ namespace BatBot.Server.Services
                         }
                     }
 
-                    ewh.WaitOne();
+                    if (_waitHandles.TryGetValue(transactionHash, out var ewh))
+                    {
+                        ewh.WaitOne();
+                    }
+
                     return _transactionStates.Remove(transactionHash, out var state) && state;
                 }
                 default:
@@ -145,7 +151,7 @@ namespace BatBot.Server.Services
                         throw new ArgumentOutOfRangeException(nameof(transactionStatus), transactionStatus, null);
                 }
 
-                await _messagingServiceService.SendTxMessage($"{statusIcon} Found transaction{(blockNumber.HasValue ? $" at {_messagingServiceService.GetEtherscanUrl($"block/{blockNumber}")}" : string.Empty)} (state: {EnumHelper.GetDescriptionFromValue(transactionStatus)})", MessageTier.End | MessageTier.Single);
+                await _messagingServiceService.SendTxMessage($"{statusIcon} Found transaction {transactionHash}{(blockNumber.HasValue ? $" at {_messagingServiceService.GetEtherscanUrl($"block/{blockNumber}")}" : string.Empty)} (state: {EnumHelper.GetDescriptionFromValue(transactionStatus)})", MessageTier.End | MessageTier.Single);
                 _transactionStates.Add(transactionHash, state);
                 ewh.Set();
             }

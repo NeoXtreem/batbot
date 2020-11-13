@@ -85,4 +85,5 @@
 	<s:Boolean x:Key="/Default/UserDictionary/Words/=Uniswap/@EntryIndexedValue">True</s:Boolean>
 	<s:Boolean x:Key="/Default/UserDictionary/Words/=Usdt/@EntryIndexedValue">True</s:Boolean>
 	<s:Boolean x:Key="/Default/UserDictionary/Words/=webhook/@EntryIndexedValue">True</s:Boolean>
+	<s:Boolean x:Key="/Default/UserDictionary/Words/=Yolo/@EntryIndexedValue">True</s:Boolean>
 	</wpf:ResourceDictionary>

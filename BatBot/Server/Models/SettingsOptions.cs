@@ -31,5 +31,7 @@
         public bool SellOnFailedTargetSwap { get; set; }
 
         public bool ShowDiscardedSwapsOutput { get; set; }
+
+        public bool YoloMode { get; set; }
     }
 }
