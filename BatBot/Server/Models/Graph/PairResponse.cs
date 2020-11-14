@@ -29,8 +29,13 @@ namespace BatBot.Server.Models.Graph
             [JsonPropertyName("token1Price")]
             public string Token1Price { get; set; }
 
+            [JsonPropertyName("reserveUSD")]
+            public string ReserveUsd { get; set; }
+
             [JsonPropertyName("createdAtTimestamp")]
             public string Created { get; set; }
+
+            public Rational ReserveUsdValue => Rational.ParseDecimal(ReserveUsd);
 
             public DateTime CreatedValue => DateTimeOffset.FromUnixTimeSeconds(long.Parse(Created)).UtcDateTime;
 

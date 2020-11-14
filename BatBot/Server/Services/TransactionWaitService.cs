@@ -39,7 +39,12 @@ namespace BatBot.Server.Services
         public void AddTransaction(string transactionHash)
         {
             // Create a wait handle to block execution until a state change is detected in the transaction.
-            _waitHandles.Add(transactionHash, new EventWaitHandle(false, EventResetMode.ManualReset, transactionHash));
+            _waitHandles.TryAdd(transactionHash, new EventWaitHandle(false, EventResetMode.ManualReset, transactionHash));
+        }
+
+        public void RemoveTransaction(string transactionHash)
+        {
+            _waitHandles.Remove(transactionHash);
         }
 
         public async Task<bool> WaitForTransaction(string transactionHash, TransactionSource transactionSource, CancellationToken cancellationToken)

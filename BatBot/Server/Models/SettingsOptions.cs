@@ -4,7 +4,9 @@
     {
         public double MaximumGasPrice { get; set; }
 
-        public decimal MinimumMarketCap { get; set; }
+        public decimal MinimumLiquidity { get; set; }
+
+        public decimal MaximumLiquidity { get; set; }
 
         public double MinimumTargetSwapEth { get; set; }
 

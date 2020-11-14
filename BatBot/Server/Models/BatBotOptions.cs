@@ -24,8 +24,6 @@
 
         public string FrontRunPrivateKey { get; set; }
 
-        public string BaseTokenAddress { get; set; }
-
         public string EtherscanBaseUrl { get; set; }
 
         public string CoinGeckoBaseUrl { get; set; }
