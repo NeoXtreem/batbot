@@ -60,7 +60,7 @@ namespace BatBot.Server.Services
                     case TransactionStatus.Failed:
                     case TransactionStatus.Stuck:
                         var blockNumber = transaction.GetProperty(Blocknative.Properties.BlockNumber);
-                        await _transactionWaitService.TransactionReceived(transactionHash, blockNumber.ValueKind == JsonValueKind.Number ? blockNumber.GetInt64() : (BigInteger?)null, transactionStatus);
+                        _transactionWaitService.TransactionReceived(transactionHash, (blockNumber.ValueKind == JsonValueKind.Number ? blockNumber.GetInt64() : (BigInteger?)null, transactionStatus));
                         break;
                     case TransactionStatus.Speedup:
                         // Ignore.

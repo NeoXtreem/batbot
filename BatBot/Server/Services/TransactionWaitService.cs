@@ -22,126 +22,142 @@ namespace BatBot.Server.Services
     public sealed class TransactionWaitService
     {
         private readonly BatBotOptions _batBotOptions;
-        private readonly MessagingService _messagingServiceService;
+        private readonly MessagingService _messagingService;
         private readonly EthereumSubscriptionService _ethereumSubscriptionService;
-        private CancellationTokenSource _cts;
 
         private readonly Dictionary<string, EventWaitHandle> _waitHandles = new Dictionary<string, EventWaitHandle>();
-        private readonly Dictionary<string, bool> _transactionStates = new Dictionary<string, bool>();
+        private readonly Dictionary<string, (BigInteger?, TransactionStatus)> _transactionStates = new Dictionary<string, (BigInteger?, TransactionStatus)>();
 
         public TransactionWaitService(IOptionsFactory<BatBotOptions> batBotOptionsFactory, MessagingService messagingService, EthereumSubscriptionService ethereumSubscriptionService)
         {
-            _messagingServiceService = messagingService;
+            _messagingService = messagingService;
             _ethereumSubscriptionService = ethereumSubscriptionService;
             _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
         }
 
-        public void AddTransaction(string transactionHash)
+        public Waiter GetWaiter(string transactionHash)
         {
-            // Create a wait handle to block execution until a state change is detected in the transaction.
-            _waitHandles.TryAdd(transactionHash, new EventWaitHandle(false, EventResetMode.ManualReset, transactionHash));
+            return new Waiter(transactionHash, _waitHandles, _transactionStates, _batBotOptions, _messagingService, _ethereumSubscriptionService);
         }
 
-        public void RemoveTransaction(string transactionHash)
+        public void TransactionReceived(string transactionHash, (BigInteger?, TransactionStatus) transactionState)
         {
-            _waitHandles.Remove(transactionHash);
+            if (!_waitHandles.TryGetValue(transactionHash, out var ewh)) return;
+            _transactionStates[transactionHash] = transactionState;
+            ewh.Set();
         }
 
-        public async Task<bool> WaitForTransaction(string transactionHash, TransactionSource transactionSource, CancellationToken cancellationToken)
+        public sealed class Waiter : IDisposable
         {
-            await _messagingServiceService.SendTxMessage($"⏳ Waiting for transaction: {_messagingServiceService.GetEtherscanUrl($"tx/{transactionHash}")}", MessageTier.Double);
+            private readonly string _transactionHash;
+            private readonly Dictionary<string, EventWaitHandle> _waitHandles;
+            private readonly Dictionary<string, (BigInteger?, TransactionStatus)> _transactionStates;
+            private readonly BatBotOptions _batBotOptions;
+            private readonly MessagingService _messagingService;
+            private readonly EthereumSubscriptionService _ethereumSubscriptionService;
+            private CancellationTokenSource _cts;
 
-            switch (transactionSource)
+            public Waiter(
+                string transactionHash,
+                Dictionary<string, EventWaitHandle> waitHandles,
+                Dictionary<string, (BigInteger?, TransactionStatus)> transactionStates,
+                BatBotOptions batBotOptions,
+                MessagingService messagingService,
+                EthereumSubscriptionService ethereumSubscriptionService)
             {
-                case TransactionSource.Mempool:
-                {
-                    using var streamingClient = new StreamingWebSocketClient(_batBotOptions.BlockchainEndpointWssUrl);
-                    var subscription = new EthLogsObservableSubscription(streamingClient);
+                _transactionHash = transactionHash;
+                _waitHandles = waitHandles;
+                _transactionStates = transactionStates;
+                _batBotOptions = batBotOptions;
+                _messagingService = messagingService;
+                _ethereumSubscriptionService = ethereumSubscriptionService;
 
-                    _cts?.Dispose();
-                    _cts = new CancellationTokenSource();
-                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
-                    var found = 0;
-                    var state = false;
-
-                    // Timer checks periodically for the transaction in case it failed.
-                    var timer = new Timer(async s => await CheckTransaction(), null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
-
-                    await _ethereumSubscriptionService.HandleSubscription(streamingClient, subscription, async () => await subscription.SubscribeAsync(), async l =>
-                    {
-                        if (l.TransactionHash == transactionHash)
-                        {
-                            await CheckTransaction();
-                        }
-                    },
-                    CheckTransaction, // Check if the transaction has already been mined once the subscription has started, to prevent a race condition.
-                    linkedCts.Token);
-
-                    await timer.DisposeAsync();
-                    return state;
-
-                    async Task CheckTransaction()
-                    {
-                        using var client = new WebSocketClient(_batBotOptions.BlockchainEndpointWssUrl);
-                        var transactionReceipt = await new EthGetTransactionReceipt(client).SendRequestAsync(transactionHash);
-                        if (!(transactionReceipt?.BlockNumber.Value.IsZero ?? true) && Interlocked.Exchange(ref found, 1) == 0)
-                        {
-                            _cts.Cancel();
-                            state = transactionReceipt.Status.Value == 1;
-                            await _messagingServiceService.SendTxMessage($"{(state ? "✔️" : "❌")} Found transaction at {_messagingServiceService.GetEtherscanUrl($"block/{transactionReceipt.BlockNumber}")}", MessageTier.End | MessageTier.Single);
-                        }
-                    }
-                }
-                case TransactionSource.BlocknativeWebhook:
-                case TransactionSource.BlocknativeWebSocket:
-                {
-                    if (transactionSource == TransactionSource.BlocknativeWebhook)
-                    {
-                        // Watch for the transaction state changing via Blocknative.
-                        using var client = new HttpClient {BaseAddress = new Uri(_batBotOptions.BlocknativeApiHttpUrl)};
-                        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(Encoding.ASCII.GetBytes($"{_batBotOptions.BlocknativeUsername}:{_batBotOptions.BlocknativePassword}")));
-                        var response = await client.PostAsJsonAsync("transaction", new TransactionMessage
-                        {
-                            ApiKey = _batBotOptions.BlocknativeApiKey,
-                            Hash = transactionHash,
-                            Blockchain = _batBotOptions.Blockchain,
-                            Network = _batBotOptions.Network
-                        }, cancellationToken);
-
-                        // In case Blocknative fails for any reason, fall back to checking the mempool directly.
-                        if (!response.IsSuccessStatusCode)
-                        {
-                            return await WaitForTransaction(transactionHash, TransactionSource.Mempool, cancellationToken);
-                        }
-                    }
-
-                    if (_waitHandles.TryGetValue(transactionHash, out var ewh))
-                    {
-                        ewh.WaitOne();
-                    }
-
-                    return _transactionStates.Remove(transactionHash, out var state) && state;
-                }
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(transactionSource), transactionSource, null);
+                // Create a wait handle to block execution until a state change is detected in the transaction.
+                _waitHandles.TryAdd(transactionHash, new EventWaitHandle(false, EventResetMode.ManualReset, _transactionHash));
             }
-        }
 
-        public async Task TransactionReceived(string transactionHash, BigInteger? blockNumber, TransactionStatus transactionStatus)
-        {
-            if (_waitHandles.Remove(transactionHash, out var ewh))
+            public async Task<bool> Wait(TransactionSource transactionSource, CancellationToken cancellationToken)
             {
-                string statusIcon;
-                var state = false;
+                await _messagingService.SendTxMessage($"⏳ Waiting for transaction: {_messagingService.GetEtherscanUrl($"tx/{_transactionHash}")}", MessageTier.Double);
+                (BigInteger? BlockNumber, TransactionStatus Status) transactionState = (null, TransactionStatus.None);
 
-                switch (transactionStatus)
+                switch (transactionSource)
+                {
+                    case TransactionSource.Mempool:
+                        {
+                            using var streamingClient = new StreamingWebSocketClient(_batBotOptions.BlockchainEndpointWssUrl);
+                            var subscription = new EthLogsObservableSubscription(streamingClient);
+
+                            _cts?.Dispose();
+                            _cts = new CancellationTokenSource();
+                            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+                            var found = 0;
+
+                            // Timer checks periodically for the transaction in case it failed.
+                            var timer = new Timer(async s => await CheckTransaction(), null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
+
+                            await _ethereumSubscriptionService.HandleSubscription(streamingClient, subscription, async () => await subscription.SubscribeAsync(), async l =>
+                            {
+                                if (l.TransactionHash == _transactionHash)
+                                {
+                                    await CheckTransaction();
+                                }
+                            },
+                            CheckTransaction, // Check if the transaction has already been mined once the subscription has started, to prevent a race condition.
+                            linkedCts.Token);
+
+                            await timer.DisposeAsync();
+
+                            async Task CheckTransaction()
+                            {
+                                using var client = new WebSocketClient(_batBotOptions.BlockchainEndpointWssUrl);
+                                var transactionReceipt = await new EthGetTransactionReceipt(client).SendRequestAsync(_transactionHash);
+                                if (!(transactionReceipt?.BlockNumber.Value.IsZero ?? true) && Interlocked.Exchange(ref found, 1) == 0)
+                                {
+                                    _cts.Cancel();
+                                    transactionState = (transactionReceipt.BlockNumber, transactionReceipt.Status.Value == 1 ? TransactionStatus.Confirmed : TransactionStatus.Failed);
+                                }
+                            }
+                        }
+                        break;
+                    case TransactionSource.BlocknativeWebhook:
+                    case TransactionSource.BlocknativeWebSocket:
+                        if (transactionSource == TransactionSource.BlocknativeWebhook)
+                        {
+                            // Watch for the transaction state changing via Blocknative.
+                            using var client = new HttpClient { BaseAddress = new Uri(_batBotOptions.BlocknativeApiHttpUrl) };
+                            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(Encoding.ASCII.GetBytes($"{_batBotOptions.BlocknativeUsername}:{_batBotOptions.BlocknativePassword}")));
+                            var response = await client.PostAsJsonAsync("transaction", new TransactionMessage
+                            {
+                                ApiKey = _batBotOptions.BlocknativeApiKey,
+                                Hash = _transactionHash,
+                                Blockchain = _batBotOptions.Blockchain,
+                                Network = _batBotOptions.Network
+                            }, cancellationToken);
+
+                            // In case Blocknative fails for any reason, fall back to checking the mempool directly.
+                            if (!response.IsSuccessStatusCode)
+                            {
+                                return await Wait(TransactionSource.Mempool, cancellationToken);
+                            }
+                        }
+
+                        _waitHandles[_transactionHash].WaitOne();
+                        _transactionStates.Remove(_transactionHash, out transactionState);
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(transactionSource), transactionSource, null);
+                }
+
+                string statusIcon;
+
+                switch (transactionState.Status)
                 {
                     case TransactionStatus.Cancel:
                         statusIcon = "🚫";
                         break;
                     case TransactionStatus.Confirmed:
                         statusIcon = "✔️";
-                        state = true;
                         break;
                     case TransactionStatus.Dropped:
                         statusIcon = "🛑";
@@ -153,16 +169,14 @@ namespace BatBot.Server.Services
                         statusIcon = "⚠️";
                         break;
                     default:
-                        throw new ArgumentOutOfRangeException(nameof(transactionStatus), transactionStatus, null);
+                        throw new InvalidOperationException($"Transaction status '{transactionState.Status}' is not supported.");
                 }
 
-                if (_transactionStates.TryAdd(transactionHash, state))
-                {
-                    await _messagingServiceService.SendTxMessage($"{statusIcon} Found transaction {transactionHash}{(blockNumber.HasValue ? $" at {_messagingServiceService.GetEtherscanUrl($"block/{blockNumber}")}" : string.Empty)} (state: {EnumHelper.GetDescriptionFromValue(transactionStatus)})");
-                }
-
-                ewh.Set();
+                await _messagingService.SendTxMessage($"{statusIcon} Found transaction {_transactionHash}{(transactionState.BlockNumber.HasValue ? $" at {_messagingService.GetEtherscanUrl($"block/{transactionState.BlockNumber}")}" : string.Empty)} (state: {EnumHelper.GetDescriptionFromValue(transactionState.Status)})", MessageTier.Single | MessageTier.End);
+                return transactionState.Status == TransactionStatus.Confirmed;
             }
+
+            public void Dispose() => _waitHandles.Remove(_transactionHash);
         }
     }
 }

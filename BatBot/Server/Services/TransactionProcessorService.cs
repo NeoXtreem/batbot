@@ -64,6 +64,7 @@ namespace BatBot.Server.Services
 
             await _backoffService.Throttle(async () =>
             {
+                using var waiter = _transactionWaitService.GetWaiter(swap.TransactionHash);
                 var prepWeb3 = new Web3(new Account(_batBotOptions.PrepPrivateKey), _batBotOptions.BlockchainEndpointHttpUrl);
 
                 var detectedMessage = $"🔎 Detected transaction: {_messagingService.GetEtherscanUrl($"tx/{swap.TransactionHash}")}";
@@ -75,64 +76,63 @@ namespace BatBot.Server.Services
                 var swapMessage = $"💱 Swap {Web3.Convert.FromWei(swap.AmountToSend)} {tokenIn.Symbol} for {Web3.Convert.FromWei(swap.AmountOutMin, tokenOut.Decimals)} {tokenOut.Symbol} with gas price {Web3.Convert.FromWei(swap.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} Gwei";
                 await SendPreFrontRunMessage(swapMessage, MessageTier.End | MessageTier.Single);
 
-                try
+                #region Validation
+
+                if (!_settingsOptions.YoloMode)
                 {
-                    _transactionWaitService.AddTransaction(swap.TransactionHash);
-
-                    #region Validation
-
-                    if (!_settingsOptions.YoloMode)
+                    // Ignore transactions that are outside of the configured ETH range.
+                    if (!swap.AmountToSend.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)))
                     {
-                        // Ignore transactions that are outside of the configured ETH range.
-                        if (!swap.AmountToSend.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)))
-                        {
-                            await SendPreFrontRunMessage("⛔ Amount to send outside of the configured range", MessageTier.End);
-                            //return;
-                        }
-
-                        // Ignore transactions with too high gas price.
-                        if (swap.GasPrice > Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei))
-                        {
-                            await SendPreFrontRunMessage("⛔ Gas price higher than the configured limit", MessageTier.End);
-                            //return;
-                        }
-
-                        _factoryAddress ??= await _blockchainService.ContractQuery<FactoryFunction, string>(prepWeb3, _batBotOptions.ContractAddress);
-
-                        // No need to perform the following check on a testnet.
-                        if (_batBotOptions.Network == BatBotOptions.Mainnet)
-                        {
-                            var pairSwap = await GetPair(prepWeb3, (tokenIn.Address, tokenOut.Address));
-
-                            if (pairSwap is null)
-                            {
-                                await SendPreFrontRunMessage("⛔ Unable to obtain pair contract for this swap", MessageTier.End);
-                                return;
-                            }
-
-                            // Check that the liquidity of the token pair is within the configured range.
-                            if (!pairSwap.ReserveUsdValue.Between((Rational)_settingsOptions.MinimumLiquidity, (Rational)_settingsOptions.MaximumLiquidity))
-                            {
-                                await SendPreFrontRunMessage($"⛔ Liquidity (${pairSwap.ReserveUsdValue.WholePart}) outside of the configured range", MessageTier.End);
-                                return;
-                            }
-
-                            // Check that the pair contract wasn't created too recently to protect against possible scam coins.
-                            if (pairSwap.CreatedValue.AddDays(_settingsOptions.MinimumPairContractAge) > DateTime.UtcNow)
-                            {
-                                await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pairSwap.CreatedValue:g})", MessageTier.End);
-                                return;
-                            }
-                        }
+                        await SendPreFrontRunMessage("⛔ Amount to send outside of the configured range", MessageTier.End);
+                        return;
                     }
 
-                    #endregion
+                    // Ignore transactions with too high gas price.
+                    if (swap.GasPrice > Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei))
+                    {
+                        await SendPreFrontRunMessage("⛔ Gas price higher than the configured limit", MessageTier.End);
+                        return;
+                    }
 
+                    _factoryAddress ??= await _blockchainService.ContractQuery<FactoryFunction, string>(prepWeb3, _batBotOptions.ContractAddress);
+
+                    // No need to perform the following check on a testnet.
+                    if (_batBotOptions.Network == BatBotOptions.Mainnet)
+                    {
+                        var pairSwap = await GetPair(prepWeb3, (tokenIn.Address, tokenOut.Address));
+
+                        if (pairSwap is null)
+                        {
+                            await SendPreFrontRunMessage("⛔ Unable to obtain pair contract for this swap", MessageTier.End);
+                            return;
+                        }
+
+                        // Check that the liquidity of the token pair is within the configured range.
+                        if (!pairSwap.ReserveUsdValue.Between((Rational)_settingsOptions.MinimumLiquidity, (Rational)_settingsOptions.MaximumLiquidity))
+                        {
+                            await SendPreFrontRunMessage($"⛔ Liquidity (${pairSwap.ReserveUsdValue.WholePart:N0}) outside of the configured range", MessageTier.End);
+                            return;
+                        }
+
+                        // Check that the pair contract wasn't created too recently to protect against possible scam coins.
+                        if (pairSwap.CreatedValue.AddDays(_settingsOptions.MinimumPairContractAge) > DateTime.UtcNow)
+                        {
+                            await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pairSwap.CreatedValue:g})", MessageTier.End);
+                            return;
+                        }
+                    }
+                }
+
+                #endregion
+
+                try
+                {
                     #region Preparation
 
                     var frontRunAmountIn = swap.AmountToSend;
                     BigInteger frontRunAmountOutMin;
                     BigInteger targetSwapAmountOut;
+                    var adjustmentFactor = 0.5;
 
                     do
                     {
@@ -162,7 +162,8 @@ namespace BatBot.Server.Services
                         }
 
                         // Adjust front run amount iteratively to get as close as possible to the amount that won't cause the target swap to fail, but keep within configured bounds.
-                        frontRunAmountIn = BigInteger.Max(BigInteger.Min((frontRunAmountIn * (Rational)(targetSwapAmountOutBelowMax ? 0.5 : 1.5)).WholePart, frontRunAmountInMax), frontRunAmountInMin);
+                        frontRunAmountIn = BigInteger.Max(BigInteger.Min((frontRunAmountIn * (Rational)(1 + adjustmentFactor * (targetSwapAmountOutBelowMax ? -1 : 1))).WholePart, frontRunAmountInMax), frontRunAmountInMin);
+                        adjustmentFactor /= 2;
                     } while (true);
 
                     // Calculate the slippage as the difference between the amounts out and amounts in ratios, then compare to the tolerance.
@@ -241,17 +242,17 @@ namespace BatBot.Server.Services
 
                     #region Pre-sell
 
-                    var waitTask = Task.Run(async () =>
+                    var waitTask = Task.Factory.StartNew(async w =>
                     {
                         // Wait for original (target's) swap to be mined.
-                        if (!_transactionWaitService.WaitForTransaction(swap.TransactionHash, swap.Source, cancellationToken).Result && !_settingsOptions.SellOnFailedTargetSwap)
+                        if (!await ((TransactionWaitService.Waiter)w).Wait(swap.Source, cancellationToken) && !_settingsOptions.SellOnFailedTargetSwap)
                         {
                             await _messagingService.SendTxMessage("‼️ Aborting (not selling) due to target swap failing (as configured)", MessageTier.End);
                             return false;
                         }
 
                         return true;
-                    }, cancellationToken);
+                    }, waiter, cancellationToken);
 
                     var approveTask = Task.Run(async () =>
                     {
@@ -282,7 +283,7 @@ namespace BatBot.Server.Services
                         return true;
                     }, cancellationToken);
 
-                    if ((await Task.WhenAll(approveTask, waitTask)).Any(r => !r)) return;
+                    if (!await waitTask.Result || !approveTask.Result) return;
 
                     #endregion
 
@@ -325,10 +326,6 @@ namespace BatBot.Server.Services
                 catch (Exception e) when (e is RpcResponseException || e is SmartContractRevertException)
                 {
                     await _messagingService.SendTxMessage($"❌ Failed with error '{e.Message}'", MessageTier.End);
-                }
-                finally
-                {
-                    _transactionWaitService.RemoveTransaction(swap.TransactionHash);
                 }
 
                 #region Local functions
