@@ -4,7 +4,7 @@ namespace BatBot.Server.Models
 {
     public class Token
     {
-        public string Address { get; set; }
+        public string Id { get; set; }
 
         public int Decimals { get; set; }
 

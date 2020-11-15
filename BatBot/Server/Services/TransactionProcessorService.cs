@@ -4,12 +4,10 @@ using System.Linq;
 using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
-using BatBot.Server.Constants;
 using BatBot.Server.Dtos;
 using BatBot.Server.Extensions;
 using BatBot.Server.Functions;
 using BatBot.Server.Models;
-using BatBot.Server.Models.Graph;
 using BatBot.Server.Types;
 using Microsoft.Extensions.Options;
 using Nethereum.ABI.FunctionEncoding;
@@ -32,11 +30,8 @@ namespace BatBot.Server.Services
         private readonly BackoffService _backoffService;
         private readonly BlockchainService _blockchainService;
         private readonly GraphService _graphService;
-        private readonly TokenInfoService _tokenInfoService;
+        private readonly PairInfoService _pairInfoService;
         private readonly TransactionWaitService _transactionWaitService;
-
-        private static string _factoryAddress;
-        private static readonly Dictionary<(string, string), string> PairAddresses = new Dictionary<(string, string), string>();
 
         public TransactionProcessorService(
             IOptionsFactory<BatBotOptions> batBotOptionsFactory,
@@ -44,7 +39,7 @@ namespace BatBot.Server.Services
             MessagingService messagingService,
             BackoffService backoffService, BlockchainService blockchainService,
             GraphService graphService,
-            TokenInfoService tokenInfoService,
+            PairInfoService pairInfoService,
             TransactionWaitService transactionWaitService)
         {
             _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
@@ -53,7 +48,7 @@ namespace BatBot.Server.Services
             _backoffService = backoffService;
             _blockchainService = blockchainService;
             _graphService = graphService;
-            _tokenInfoService = tokenInfoService;
+            _pairInfoService = pairInfoService;
             _transactionWaitService = transactionWaitService;
         }
 
@@ -70,8 +65,16 @@ namespace BatBot.Server.Services
                 var detectedMessage = $"🔎 Detected transaction: {_messagingService.GetEtherscanUrl($"tx/{swap.TransactionHash}")}";
                 await SendPreFrontRunMessage(detectedMessage, MessageTier.Double);
 
-                var tokenIn = await _tokenInfoService.GetToken(prepWeb3, swap.Path.First(), cancellationToken);
-                var tokenOut = await _tokenInfoService.GetToken(prepWeb3, swap.Path.Last(), cancellationToken);
+                var pair = await _pairInfoService.GetPair(prepWeb3, (swap.Path.First(), swap.Path.Last()), cancellationToken);
+
+                if (pair is null)
+                {
+                    await SendPreFrontRunMessage("⛔ Unable to obtain pair contract for this swap", MessageTier.End);
+                    return;
+                }
+
+                var tokenIn = pair.GetToken(swap.Path.First());
+                var tokenOut = pair.GetToken(swap.Path.Last());
 
                 var swapMessage = $"💱 Swap {Web3.Convert.FromWei(swap.AmountToSend)} {tokenIn.Symbol} for {Web3.Convert.FromWei(swap.AmountOutMin, tokenOut.Decimals)} {tokenOut.Symbol} with gas price {Web3.Convert.FromWei(swap.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} Gwei";
                 await SendPreFrontRunMessage(swapMessage, MessageTier.End | MessageTier.Single);
@@ -94,30 +97,20 @@ namespace BatBot.Server.Services
                         return;
                     }
 
-                    _factoryAddress ??= await _blockchainService.ContractQuery<FactoryFunction, string>(prepWeb3, _batBotOptions.ContractAddress);
-
                     // No need to perform the following check on a testnet.
                     if (_batBotOptions.Network == BatBotOptions.Mainnet)
                     {
-                        var pairSwap = await GetPair(prepWeb3, (tokenIn.Address, tokenOut.Address));
-
-                        if (pairSwap is null)
-                        {
-                            await SendPreFrontRunMessage("⛔ Unable to obtain pair contract for this swap", MessageTier.End);
-                            return;
-                        }
-
                         // Check that the liquidity of the token pair is within the configured range.
-                        if (!pairSwap.ReserveUsdValue.Between((Rational)_settingsOptions.MinimumLiquidity, (Rational)_settingsOptions.MaximumLiquidity))
+                        if (!pair.ReserveUsd.Between((Rational)_settingsOptions.MinimumLiquidity, (Rational)_settingsOptions.MaximumLiquidity))
                         {
-                            await SendPreFrontRunMessage($"⛔ Liquidity (${pairSwap.ReserveUsdValue.WholePart:N0}) outside of the configured range", MessageTier.End);
+                            await SendPreFrontRunMessage($"⛔ Liquidity (${pair.ReserveUsd.WholePart:N0}) outside of the configured range", MessageTier.End);
                             return;
                         }
 
                         // Check that the pair contract wasn't created too recently to protect against possible scam coins.
-                        if (pairSwap.CreatedValue.AddDays(_settingsOptions.MinimumPairContractAge) > DateTime.UtcNow)
+                        if (pair.Created.AddDays(_settingsOptions.MinimumPairContractAge) > DateTime.UtcNow)
                         {
-                            await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pairSwap.CreatedValue:g})", MessageTier.End);
+                            await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pair.Created:g})", MessageTier.End);
                             return;
                         }
                     }
@@ -329,17 +322,6 @@ namespace BatBot.Server.Services
                 }
 
                 #region Local functions
-
-                async Task<PairResponse.PairType> GetPair(IWeb3 web3, (string TokenA, string TokenB) tokens)
-                {
-                    if (!PairAddresses.TryGetValue(tokens, out var pairAddress))
-                    {
-                        pairAddress = (await _blockchainService.ContractQuery<GetPairFunction, string>(web3, _factoryAddress, new GetPairFunction {TokenA = tokens.TokenA, TokenB = tokens.TokenB})).ToLowerInvariant();
-                        PairAddresses.Add(tokens, pairAddress);
-                    }
-
-                    return pairAddress != Uniswap.InvalidAddress ? (await _graphService.SendQuery<PairResponse>(new {id = pairAddress}, cancellationToken: cancellationToken)).Pair : null;
-                }
 
                 async Task SendPreFrontRunMessage(string message, MessageTier messageTier)
                 {

@@ -4,10 +4,10 @@ using BatBot.Server.Models.Graph.Types;
 
 namespace BatBot.Server.Models.Graph
 {
-    [Description("Pair")]
-    public class PairResponse
+    [Description("Swap")]
+    public class SwapResponse
     {
-        [JsonPropertyName("pair")]
-        public PairType Pair { get; set; }
+        [JsonPropertyName("token")]
+        public SwapType Swap { get; set; }
     }
 }

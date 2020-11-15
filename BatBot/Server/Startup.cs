@@ -27,12 +27,12 @@ namespace BatBot.Server
         public void ConfigureServices(IServiceCollection services)
         {
             services
-                .AddScoped<BlockchainService>()
                 .AddScoped<MempoolMonitoringService>()
                 .AddScoped<BlocknativeMonitoringService>()
                 .AddScoped<TransactionProcessorService>()
                 .AddScoped<BlocknativeMessageService>()
-                .AddScoped<TokenInfoService>()
+                .AddSingleton<BlockchainService>()
+                .AddSingleton<PairInfoService>()
                 .AddSingleton<BackoffService>()
                 .AddSingleton<MessagingService>()
                 .AddSingleton<GraphService>()
@@ -40,7 +40,8 @@ namespace BatBot.Server
                 .AddSingleton<TransactionWaitService>()
                 .Configure<BatBotOptions>(Configuration.GetSection("BatBot"))
                 .Configure<SettingsOptions>(Configuration.GetSection("Settings"))
-                .AddAutoMapper(typeof(TransactionProfile));
+                .AddAutoMapper(typeof(TransactionProfile))
+                .AddAutoMapper(typeof(GraphProfile));
 
             services.AddControllersWithViews();
             services.AddRazorPages();
