@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Text.Json.Serialization;
 
-namespace BatBot.Server.Models.Blocknative
+namespace BatBot.Server.Models.Blocknative.Abstractions
 {
     public abstract class WebSocketMessage
     {

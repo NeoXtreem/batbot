@@ -23,21 +23,21 @@ namespace BatBot.Server.Services
     {
         private readonly BatBotOptions _batBotOptions;
         private readonly MessagingService _messagingService;
-        private readonly EthereumSubscriptionService _ethereumSubscriptionService;
+        private readonly EthereumService _ethereumService;
 
         private readonly Dictionary<string, EventWaitHandle> _waitHandles = new Dictionary<string, EventWaitHandle>();
         private readonly Dictionary<string, (BigInteger?, TransactionStatus)> _transactionStates = new Dictionary<string, (BigInteger?, TransactionStatus)>();
 
-        public TransactionWaitService(IOptionsFactory<BatBotOptions> batBotOptionsFactory, MessagingService messagingService, EthereumSubscriptionService ethereumSubscriptionService)
+        public TransactionWaitService(IOptionsFactory<BatBotOptions> batBotOptionsFactory, MessagingService messagingService, EthereumService ethereumService)
         {
             _messagingService = messagingService;
-            _ethereumSubscriptionService = ethereumSubscriptionService;
+            _ethereumService = ethereumService;
             _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
         }
 
         public Waiter GetWaiter(string transactionHash)
         {
-            return new Waiter(transactionHash, _waitHandles, _transactionStates, _batBotOptions, _messagingService, _ethereumSubscriptionService);
+            return new Waiter(transactionHash, _waitHandles, _transactionStates, _batBotOptions, _messagingService, _ethereumService);
         }
 
         public void TransactionReceived(string transactionHash, (BigInteger?, TransactionStatus) transactionState)
@@ -54,7 +54,7 @@ namespace BatBot.Server.Services
             private readonly Dictionary<string, (BigInteger?, TransactionStatus)> _transactionStates;
             private readonly BatBotOptions _batBotOptions;
             private readonly MessagingService _messagingService;
-            private readonly EthereumSubscriptionService _ethereumSubscriptionService;
+            private readonly EthereumService _ethereumService;
             private CancellationTokenSource _cts;
 
             public Waiter(
@@ -63,14 +63,14 @@ namespace BatBot.Server.Services
                 Dictionary<string, (BigInteger?, TransactionStatus)> transactionStates,
                 BatBotOptions batBotOptions,
                 MessagingService messagingService,
-                EthereumSubscriptionService ethereumSubscriptionService)
+                EthereumService ethereumService)
             {
                 _transactionHash = transactionHash;
                 _waitHandles = waitHandles;
                 _transactionStates = transactionStates;
                 _batBotOptions = batBotOptions;
                 _messagingService = messagingService;
-                _ethereumSubscriptionService = ethereumSubscriptionService;
+                _ethereumService = ethereumService;
 
                 // Create a wait handle to block execution until a state change is detected in the transaction.
                 _waitHandles.TryAdd(transactionHash, new EventWaitHandle(false, EventResetMode.ManualReset, _transactionHash));
@@ -96,7 +96,7 @@ namespace BatBot.Server.Services
                             // Timer checks periodically for the transaction in case it failed.
                             var timer = new Timer(async s => await CheckTransaction(), null, TimeSpan.Zero, TimeSpan.FromSeconds(5));
 
-                            await _ethereumSubscriptionService.HandleSubscription(streamingClient, subscription, async () => await subscription.SubscribeAsync(), async l =>
+                            await _ethereumService.HandleSubscription(streamingClient, subscription, async () => await subscription.SubscribeAsync(), async l =>
                             {
                                 if (l.TransactionHash == _transactionHash)
                                 {

@@ -4,10 +4,15 @@ using System.Linq;
 using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
+using AutoMapper;
+using BatBot.Server.Constants;
 using BatBot.Server.Dtos;
+using BatBot.Server.Dtos.Graph;
 using BatBot.Server.Extensions;
 using BatBot.Server.Functions;
+using BatBot.Server.Helpers;
 using BatBot.Server.Models;
+using BatBot.Server.Models.Graph;
 using BatBot.Server.Types;
 using Microsoft.Extensions.Options;
 using Nethereum.ABI.FunctionEncoding;
@@ -19,6 +24,7 @@ using Nethereum.Util;
 using Nethereum.Web3;
 using Nethereum.Web3.Accounts;
 using Rationals;
+using Swap = BatBot.Server.Models.Swap;
 
 namespace BatBot.Server.Services
 {
@@ -26,30 +32,39 @@ namespace BatBot.Server.Services
     {
         private readonly BatBotOptions _batBotOptions;
         private readonly SettingsOptions _settingsOptions;
+        private readonly IMapper _mapper;
         private readonly MessagingService _messagingService;
         private readonly BackoffService _backoffService;
-        private readonly BlockchainService _blockchainService;
-        private readonly GraphService _graphService;
-        private readonly PairInfoService _pairInfoService;
         private readonly TransactionWaitService _transactionWaitService;
+        private readonly PairInfoService _pairInfoService;
+        private readonly GraphService _graphService;
+        private readonly EthereumService _ethereumService;
+        private readonly SmartContractService _smartContractService;
+
+        private readonly HashSet<string> _pairWhitelist = new HashSet<string>();
 
         public TransactionProcessorService(
             IOptionsFactory<BatBotOptions> batBotOptionsFactory,
             IOptionsFactory<SettingsOptions> settingsOptionsFactory,
+            IMapper mapper,
             MessagingService messagingService,
-            BackoffService backoffService, BlockchainService blockchainService,
-            GraphService graphService,
+            BackoffService backoffService,
+            TransactionWaitService transactionWaitService,
             PairInfoService pairInfoService,
-            TransactionWaitService transactionWaitService)
+            GraphService graphService,
+            EthereumService ethereumService,
+            SmartContractService smartContractService)
         {
             _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
             _settingsOptions = settingsOptionsFactory.Create(Options.DefaultName);
+            _mapper = mapper;
             _messagingService = messagingService;
             _backoffService = backoffService;
-            _blockchainService = blockchainService;
-            _graphService = graphService;
-            _pairInfoService = pairInfoService;
             _transactionWaitService = transactionWaitService;
+            _pairInfoService = pairInfoService;
+            _graphService = graphService;
+            _ethereumService = ethereumService;
+            _smartContractService = smartContractService;
         }
 
         public async Task Process(Swap swap, CancellationToken cancellationToken)
@@ -76,7 +91,7 @@ namespace BatBot.Server.Services
                 var tokenIn = pair.GetToken(swap.Path.First());
                 var tokenOut = pair.GetToken(swap.Path.Last());
 
-                var swapMessage = $"💱 Swap {Web3.Convert.FromWei(swap.AmountToSend)} {tokenIn.Symbol} for {Web3.Convert.FromWei(swap.AmountOutMin, tokenOut.Decimals)} {tokenOut.Symbol} with gas price {Web3.Convert.FromWei(swap.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} Gwei";
+                var swapMessage = $"💱 Swap {Web3.Convert.FromWei(swap.AmountIn)} {tokenIn.Symbol} for {Web3.Convert.FromWei(swap.AmountOutMin, tokenOut.Decimals)} {tokenOut.Symbol} with gas price {Web3.Convert.FromWei(swap.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} Gwei";
                 await SendPreFrontRunMessage(swapMessage, MessageTier.End | MessageTier.Single);
 
                 #region Validation
@@ -84,7 +99,7 @@ namespace BatBot.Server.Services
                 if (!_settingsOptions.YoloMode)
                 {
                     // Ignore transactions that are outside of the configured ETH range.
-                    if (!swap.AmountToSend.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)))
+                    if (!swap.AmountIn.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)))
                     {
                         await SendPreFrontRunMessage("⛔ Amount to send outside of the configured range", MessageTier.End);
                         return;
@@ -107,11 +122,62 @@ namespace BatBot.Server.Services
                             return;
                         }
 
-                        // Check that the pair contract wasn't created too recently to protect against possible scam coins.
-                        if (pair.Created.AddDays(_settingsOptions.MinimumPairContractAge) > DateTime.UtcNow)
+                        if (!_pairWhitelist.Contains(pair.Id))
                         {
-                            await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pair.Created:g})", MessageTier.End);
-                            return;
+                            // Check that the pair contract wasn't created too recently to protect against possible scam coins.
+                            if (pair.Created.AddDays(_settingsOptions.MinimumPairContractAge) > DateTime.UtcNow)
+                            {
+                                await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pair.Created:g})", MessageTier.End);
+                                return;
+                            }
+
+                            // Check that there have been historical swaps selling the output token, to ensure the contract is legitimate.
+                            var idName = JsonHelper.GetJsonPropertyName<PairType>(nameof(PairType.Id));
+
+                            var recentSwaps = new List<Models.Graph.Swap>();
+                            int previousCount;
+
+                            do
+                            {
+                                previousCount = recentSwaps.Count;
+                                recentSwaps.AddRange(_mapper.Map<IEnumerable<Models.Graph.Swap>>((await _graphService.SendQuery<SwapsResponse>(
+                                    new Dictionary<string, string> { { idName, Graph.Types.Id } },
+                                    new Dictionary<string, object>
+                                    {
+                                        {Graph.OrderBy, JsonHelper.GetJsonPropertyName<SwapType>(nameof(SwapType.Timestamp))},
+                                        {Graph.OrderDirection, Graph.Descending},
+                                        {Graph.Where, new Dictionary<string, object>
+                                        {
+                                            {JsonHelper.GetJsonPropertyName<PairResponse>(nameof(PairResponse.Pair)), $"${idName}"},
+                                            {$"{JsonHelper.GetJsonPropertyName<SwapType>(pair.GetToken(tokenIn.Id) == pair.Token0 ? nameof(SwapType.Amount0Out) : nameof(SwapType.Amount1Out))}{Graph.Gte}", _settingsOptions.HistoricalAnalysisMinEthOut},
+                                            {$"{JsonHelper.GetJsonPropertyName<SwapType>(nameof(SwapType.Timestamp))}{Graph.Lt}", recentSwaps.Any() ? ((DateTimeOffset)recentSwaps.Last().Timestamp).ToUnixTimeSeconds() : DateTimeOffset.UtcNow.ToUnixTimeSeconds()}
+                                        }}
+                                    },
+                                    new Dictionary<string, HashSet<string>>
+                                    {
+                                        {nameof(SwapType), new HashSet<string> {nameof(SwapType.Pair)}}
+                                    },
+                                    new { id = pair.Id },
+                                    cancellationToken: cancellationToken)).Swaps));
+                            } while (recentSwaps.Count.Between(previousCount, _settingsOptions.HistoricalAnalysisMinFetchThreshold, false));
+
+                            var relevantSwaps = (await Task.WhenAll(recentSwaps.Select(async s => await _ethereumService.GetSwap(s.Transaction.Id)))).Where(s => s != null).ToArray();
+
+                            if (relevantSwaps.Length < _settingsOptions.HistoricalAnalysisMinRelevantSwaps)
+                            {
+                                await SendPreFrontRunMessage($"⛔ Number of relevant swaps ({relevantSwaps.Length} out of {recentSwaps.Count}) is too low.", MessageTier.End);
+                                return;
+                            }
+
+                            var uniqueRecipients = relevantSwaps.GroupBy(s => s.To).Count();
+
+                            if (uniqueRecipients / (double)relevantSwaps.Length < _settingsOptions.MinimumUniqueSellRecipientsRatio)
+                            {
+                                await SendPreFrontRunMessage($"⛔ Number of unique recipients in the relevant swaps ({uniqueRecipients} out of {relevantSwaps.Length}) is too low.", MessageTier.End);
+                                return;
+                            }
+
+                            _pairWhitelist.Add(pair.Id);
                         }
                     }
                 }
@@ -122,7 +188,7 @@ namespace BatBot.Server.Services
                 {
                     #region Preparation
 
-                    var frontRunAmountIn = swap.AmountToSend;
+                    var frontRunAmountIn = swap.AmountIn;
                     BigInteger frontRunAmountOutMin;
                     BigInteger targetSwapAmountOut;
                     var adjustmentFactor = 0.5;
@@ -131,7 +197,7 @@ namespace BatBot.Server.Services
                     {
                         // Find the optimal amount to front run with by inferring the effect of slippage from iterative queries to the smart contract.
                         frontRunAmountOutMin = await GetAmountOut(prepWeb3, frontRunAmountIn, swap.Path);
-                        targetSwapAmountOut = await GetAmountOut(prepWeb3, swap.AmountToSend + frontRunAmountIn, swap.Path) - frontRunAmountOutMin;
+                        targetSwapAmountOut = await GetAmountOut(prepWeb3, swap.AmountIn + frontRunAmountIn, swap.Path) - frontRunAmountOutMin;
 
                         var frontRunAmountInMin = Web3.Convert.ToWei(_settingsOptions.MinimumFrontRunEth);
                         var frontRunAmountInMax = Web3.Convert.ToWei(_settingsOptions.MaximumFrontRunEth);
@@ -160,7 +226,7 @@ namespace BatBot.Server.Services
                     } while (true);
 
                     // Calculate the slippage as the difference between the amounts out and amounts in ratios, then compare to the tolerance.
-                    var slippage = new Rational(frontRunAmountOutMin) / new Rational(targetSwapAmountOut) / (new Rational(frontRunAmountIn) / new Rational(swap.AmountToSend)) - 1;
+                    var slippage = new Rational(frontRunAmountOutMin) / new Rational(targetSwapAmountOut) / (new Rational(frontRunAmountIn) / new Rational(swap.AmountIn)) - 1;
                     if (!_settingsOptions.YoloMode && slippage < (Rational)_settingsOptions.SlippageTolerance)
                     {
                         await SendPreFrontRunMessage($"⛔ Slippage ({(double)slippage:P}) too tight to front run", MessageTier.End);
@@ -216,7 +282,7 @@ namespace BatBot.Server.Services
 
                     // Now attempt to front run the target swap with a faster swap.
                     await _messagingService.SendTxMessage($"🏃 Front running {Web3.Convert.FromWei(frontRunBuyMessage.AmountToSend)} {tokenIn.Symbol} with gas price {Web3.Convert.FromWei(frontRunBuyMessage.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} gwei", MessageTier.Double);
-                    var frontRunBuyReceipt = await _blockchainService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, _batBotOptions.ContractAddress, frontRunBuyMessage, false);
+                    var frontRunBuyReceipt = await _smartContractService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, _batBotOptions.ContractAddress, frontRunBuyMessage, false);
                     await _messagingService.SendTxMessage($"#️⃣ Front run transaction: {_messagingService.GetEtherscanUrl($"tx/{frontRunBuyReceipt.TransactionHash}")}");
 
                     if (frontRunBuyReceipt.Failed())
@@ -251,7 +317,7 @@ namespace BatBot.Server.Services
                     {
                         // Ensure that the tokens bought are approved for selling before purchasing.
                         await _messagingService.SendTxMessage($"❓ Checking spender {_batBotOptions.ContractAddress} allowed");
-                        var allowed = await _blockchainService.ContractQuery<AllowanceFunction, BigInteger>(frontRunWeb3, frontRunSellMessage.Path.First(), new AllowanceFunction
+                        var allowed = await _smartContractService.ContractQuery<AllowanceFunction, BigInteger>(frontRunWeb3, frontRunSellMessage.Path.First(), new AllowanceFunction
                         {
                             Owner = _batBotOptions.FrontRunWalletAddress,
                             Spender = _batBotOptions.ContractAddress
@@ -260,7 +326,7 @@ namespace BatBot.Server.Services
                         if (allowed.IsZero)
                         {
                             await _messagingService.SendTxMessage($"🤝 Approving spender {_batBotOptions.ContractAddress}");
-                            var approveReceipt = await _blockchainService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, frontRunSellMessage.Path.First(), new ApproveFunction
+                            var approveReceipt = await _smartContractService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, frontRunSellMessage.Path.First(), new ApproveFunction
                             {
                                 Spender = _batBotOptions.ContractAddress,
                                 Value = (BigInteger.One << 256) - 1
@@ -289,7 +355,7 @@ namespace BatBot.Server.Services
                     try
                     {
                         // Sell the front run tokens bought earlier.
-                        frontRunSellReceipt = await _blockchainService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, _batBotOptions.ContractAddress, frontRunSellMessage);
+                        frontRunSellReceipt = await _smartContractService.ContractSendRequestAndWaitForReceipt(frontRunWeb3, _batBotOptions.ContractAddress, frontRunSellMessage);
                     }
                     catch (SmartContractRevertException e)
                     {
@@ -335,7 +401,7 @@ namespace BatBot.Server.Services
                     }
                 }
 
-                async Task<BigInteger> GetAmountOut(IWeb3 web3, BigInteger amountIn, List<string> path) => (await _blockchainService.ContractQuery<GetAmountsOutFunction, List<BigInteger>>(web3, _batBotOptions.ContractAddress, new GetAmountsOutFunction
+                async Task<BigInteger> GetAmountOut(IWeb3 web3, BigInteger amountIn, List<string> path) => (await _smartContractService.ContractQuery<GetAmountsOutFunction, List<BigInteger>>(web3, _batBotOptions.ContractAddress, new GetAmountsOutFunction
                 {
                     AmountIn = amountIn,
                     Path = path

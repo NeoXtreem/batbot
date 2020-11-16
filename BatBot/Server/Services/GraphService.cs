@@ -7,7 +7,6 @@ using System.Text;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
-using BatBot.Server.Attributes;
 using BatBot.Server.Models;
 using GraphQL;
 using GraphQL.Client.Http;
@@ -21,63 +20,49 @@ namespace BatBot.Server.Services
         private readonly BatBotOptions _batBotOptions;
         private readonly MessagingService _messagingService;
 
-        private readonly Dictionary<Type, string> _queries = new Dictionary<Type, string>();
-
         public GraphService(IOptionsFactory<BatBotOptions> batBotOptionsFactory, MessagingService messagingService)
         {
             _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
             _messagingService = messagingService;
         }
 
-        public async Task<T> SendQuery<T>(object variables = null, string operationName = null, CancellationToken cancellationToken = default)
+        public async Task<T> SendQuery<T>(Dictionary<string, string> variableTypes = null, Dictionary<string, object> filters = null, Dictionary<string, HashSet<string>> exclusions = null, object variables = null, string operationName = null, CancellationToken cancellationToken = default)
         {
             using var graphQLClient = new GraphQLHttpClient(_batBotOptions.UniswapSubgraphUrl, new SystemTextJsonSerializer());
-
             await _messagingService.SendLogMessage($"⚡ Sending Graph query '{typeof(T).GetCustomAttribute<DescriptionAttribute>()?.Description}' with variables '{variables}'");
-            return (await graphQLClient.SendQueryAsync<T>(new GraphQLRequest(BuildQuery(typeof(T), new List<(string, string)>()), variables, operationName), cancellationToken)).Data;
+            return (await graphQLClient.SendQueryAsync<T>(new GraphQLRequest(BuildQuery(typeof(T), variableTypes, filters, exclusions), variables, operationName), cancellationToken)).Data;
         }
 
-        private string BuildQuery(Type type, ICollection<(string Name, string TypeName)> variableTypes, bool isRoot = true)
+        private static string BuildQuery(Type type, Dictionary<string, string> variableTypes = null, Dictionary<string, object> filters = null, IReadOnlyDictionary<string, HashSet<string>> exclusions = null)
         {
-            // Cache previous queries in a dictionary for quicker access.
-            if (isRoot && _queries.TryGetValue(type, out var query)) return query;
-
             var properties = type.GetProperties().Where(p => p.GetCustomAttribute<JsonPropertyNameAttribute>() != null).ToArray();
             if (!properties.Any()) return string.Empty;
 
             var queryBuilder = new StringBuilder(" {");
 
-            queryBuilder.Append(string.Join(" ", properties.Select(p =>
+            // The Where clause ensures excluded properties are not part of the query.
+            queryBuilder.Append(string.Join(" ", properties.Where(p => exclusions is null || !exclusions.TryGetValue(type.Name, out var excluded) || !excluded.Contains(p.Name)).Select(p =>
             {
-                var variableName = p.GetCustomAttribute<JsonPropertyNameAttribute>()?.Name;
-                var typeName = p.GetCustomAttribute<GraphQLVariableAttribute>()?.TypeName;
-
-                // The variable type name is stored in the collection passed through the recursive function calls so that it can be used at the root call.
-                if (typeName != null)
-                {
-                    variableTypes.Add((variableName, typeName));
-                }
-
-                return new StringBuilder(BuildQuery(p.PropertyType, variableTypes, false))
-                    .Insert(0, $"{variableName}{(isRoot ? $"({string.Join(",", variableTypes.Select(x => $"{x.Name}: ${x.Name}"))})" : string.Empty)}")
+                return new StringBuilder(BuildQuery(p.PropertyType.IsConstructedGenericType && p.PropertyType.GetGenericTypeDefinition() == typeof(List<>) ? p.PropertyType.GetGenericArguments().Single() : p.PropertyType, exclusions: exclusions))
+                    .Insert(0, $"{p.GetCustomAttribute<JsonPropertyNameAttribute>()?.Name}{(filters?.Any() == true ? $"({BuildFilter(filters)})" : string.Empty)}")
                     .ToString();
+
+                static string BuildFilter(Dictionary<string, object> filters)
+                {
+                    return string.Join(", ", filters.Select(f =>
+                    {
+                        var (key, value) = f;
+                        return $"{key}: {(value is Dictionary<string, object> @object ? $"{{{BuildFilter(@object)}}}" : $"{value}")}";
+                    }));
+                }
             })));
 
-            if (isRoot)
+            if (variableTypes?.Any() == true)
             {
-                queryBuilder.Insert(0, $"query({string.Join(", ", variableTypes.Select(x => $"${x.Name}: {x.TypeName}"))})");
+                queryBuilder.Insert(0, $"query({string.Join(", ", variableTypes.Select(x => $"${x.Key}: {x.Value}"))})");
             }
 
-            queryBuilder.Append("}");
-
-            query = queryBuilder.ToString();
-
-            if (isRoot)
-            {
-                _queries.Add(type, query);
-            }
-
-            return query;
+            return queryBuilder.Append("}").ToString();
         }
     }
 }

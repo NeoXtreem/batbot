@@ -13,6 +13,7 @@ using BatBot.Server.Constants;
 using BatBot.Server.Converters;
 using BatBot.Server.Models;
 using BatBot.Server.Models.Blocknative;
+using BatBot.Server.Models.Blocknative.Abstractions;
 using BatBot.Server.Types;
 using Microsoft.Extensions.Options;
 using Nethereum.Util;

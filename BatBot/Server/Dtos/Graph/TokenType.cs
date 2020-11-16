@@ -1,6 +1,6 @@
 ﻿using System.Text.Json.Serialization;
 
-namespace BatBot.Server.Models.Graph.Types
+namespace BatBot.Server.Dtos.Graph
 {
     public class TokenType
     {

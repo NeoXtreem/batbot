@@ -2,21 +2,29 @@
 {
     public class SettingsOptions
     {
-        public double MaximumGasPrice { get; set; }
+        public decimal MaximumGasPrice { get; set; }
 
         public decimal MinimumLiquidity { get; set; }
 
         public decimal MaximumLiquidity { get; set; }
 
-        public double MinimumTargetSwapEth { get; set; }
+        public decimal MinimumTargetSwapEth { get; set; }
 
-        public double MaximumTargetSwapEth { get; set; }
+        public decimal MaximumTargetSwapEth { get; set; }
 
         public double MinimumPairContractAge { get; set; }
 
-        public double MinimumFrontRunEth { get; set; }
+        public decimal MinimumFrontRunEth { get; set; }
 
-        public double MaximumFrontRunEth { get; set; }
+        public decimal MaximumFrontRunEth { get; set; }
+
+        public decimal HistoricalAnalysisMinEthOut { get; set; }
+
+        public int HistoricalAnalysisMinFetchThreshold { get; set; }
+
+        public int HistoricalAnalysisMinRelevantSwaps { get; set; }
+
+        public double MinimumUniqueSellRecipientsRatio { get; set; }
 
         public double SlippageTolerance { get; set; }
 

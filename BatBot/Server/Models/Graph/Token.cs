@@ -1,6 +1,6 @@
 ﻿using System.Numerics;
 
-namespace BatBot.Server.Models
+namespace BatBot.Server.Models.Graph
 {
     public class Token
     {

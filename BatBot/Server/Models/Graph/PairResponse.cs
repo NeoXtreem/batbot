@@ -1,6 +1,6 @@
 ﻿using System.ComponentModel;
 using System.Text.Json.Serialization;
-using BatBot.Server.Models.Graph.Types;
+using BatBot.Server.Dtos.Graph;
 
 namespace BatBot.Server.Models.Graph
 {

@@ -14,12 +14,12 @@ using Rationals;
 
 namespace BatBot.Server.Services
 {
-    public class BlockchainService
+    public class SmartContractService
     {
         private readonly SettingsOptions _settingsOptions;
         private readonly MessagingService _messagingService;
 
-        public BlockchainService(IOptionsFactory<SettingsOptions> settingsOptionsFactory, MessagingService messagingService)
+        public SmartContractService(IOptionsFactory<SettingsOptions> settingsOptionsFactory, MessagingService messagingService)
         {
             _settingsOptions = settingsOptionsFactory.Create(Options.DefaultName);
             _messagingService = messagingService;

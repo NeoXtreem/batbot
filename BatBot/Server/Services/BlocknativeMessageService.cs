@@ -41,7 +41,7 @@ namespace BatBot.Server.Services
                         await _transactionProcessorService.Process(new Swap
                         {
                             TransactionHash = transactionHash,
-                            AmountToSend = TryParseJsonString(transaction, Blocknative.Properties.Value),
+                            AmountIn = TryParseJsonString(transaction, Blocknative.Properties.Value),
                             Gas = transaction.GetProperty(Blocknative.Properties.Gas).GetUInt64(),
                             GasPrice = TryParseJsonString(transaction, Blocknative.Properties.GasPrice),
                             AmountOutMin = TryParseJsonString(@params, Blocknative.Properties.AmountOutMin),

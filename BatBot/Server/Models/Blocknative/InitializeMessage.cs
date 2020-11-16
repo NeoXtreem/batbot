@@ -1,4 +1,6 @@
-﻿namespace BatBot.Server.Models.Blocknative
+﻿using BatBot.Server.Models.Blocknative.Abstractions;
+
+namespace BatBot.Server.Models.Blocknative
 {
     public class InitializeMessage : WebSocketMessage
     {

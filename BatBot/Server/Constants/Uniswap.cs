@@ -6,6 +6,7 @@
         public const string SwapExactEthForTokensSupportingFeeOnTransferTokens = "swapExactETHForTokensSupportingFeeOnTransferTokens";
         public const string SwapExactTokensForEth = "swapExactTokensForETH";
         public const string SwapExactTokensForEthSupportingFeeOnTransferTokens = "swapExactTokensForETHSupportingFeeOnTransferTokens";
+        public const string SwapTokensForExactEth = "swapTokensForExactETH";
         public const string InvalidAddress = "0x0000000000000000000000000000000000000000";
 
         internal static class Types

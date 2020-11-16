@@ -4,7 +4,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using AutoMapper;
 using BatBot.Server.Constants;
+using BatBot.Server.Dtos.Graph;
 using BatBot.Server.Functions;
+using BatBot.Server.Helpers;
 using BatBot.Server.Models;
 using BatBot.Server.Models.Graph;
 using Microsoft.Extensions.Options;
@@ -17,33 +19,40 @@ namespace BatBot.Server.Services
     {
         private readonly BatBotOptions _batBotOptions;
         private readonly IMapper _mapper;
-        private readonly BlockchainService _blockchainService;
+        private readonly SmartContractService _smartContractService;
         private readonly GraphService _graphService;
 
         private string _factoryAddress;
         private readonly Dictionary<(string, string), string> _pairAddresses = new Dictionary<(string, string), string>();
 
-        public PairInfoService(IOptionsFactory<BatBotOptions> batBotOptionsFactory, IMapper mapper, BlockchainService blockchainService, GraphService graphService)
+        public PairInfoService(IOptionsFactory<BatBotOptions> batBotOptionsFactory, IMapper mapper, SmartContractService smartContractService, GraphService graphService)
         {
             _batBotOptions = batBotOptionsFactory.Create(Options.DefaultName);
             _mapper = mapper;
-            _blockchainService = blockchainService;
+            _smartContractService = smartContractService;
             _graphService = graphService;
         }
 
         public async Task<Pair> GetPair(IWeb3 web3, (string TokenA, string TokenB) tokenAddresses, CancellationToken cancellationToken = default)
         {
-            _factoryAddress ??= await _blockchainService.ContractQuery<FactoryFunction, string>(web3, _batBotOptions.ContractAddress);
+            _factoryAddress ??= await _smartContractService.ContractQuery<FactoryFunction, string>(web3, _batBotOptions.ContractAddress);
 
             if (!_pairAddresses.TryGetValue(tokenAddresses, out var pairAddress))
             {
-                pairAddress = (await _blockchainService.ContractQuery<GetPairFunction, string>(web3, _factoryAddress, new GetPairFunction {TokenA = tokenAddresses.TokenA, TokenB = tokenAddresses.TokenB})).ToLowerInvariant();
+                pairAddress = (await _smartContractService.ContractQuery<GetPairFunction, string>(web3, _factoryAddress, new GetPairFunction {TokenA = tokenAddresses.TokenA, TokenB = tokenAddresses.TokenB})).ToLowerInvariant();
                 _pairAddresses.Add(tokenAddresses, pairAddress);
             }
 
             if (_batBotOptions.Network == BatBotOptions.Mainnet)
             {
-                return pairAddress != Uniswap.InvalidAddress ? _mapper.Map<Pair>((await _graphService.SendQuery<PairResponse>(new {id = pairAddress.ToLowerInvariant()}, cancellationToken: cancellationToken)).Pair) : null;
+                var idName = JsonHelper.GetJsonPropertyName<PairType>(nameof(PairType.Id));
+                return pairAddress != Uniswap.InvalidAddress
+                    ? _mapper.Map<Pair>((await _graphService.SendQuery<PairResponse>(
+                        new Dictionary<string, string> {{idName, Graph.Types.Id}},
+                        new Dictionary<string, object> {{idName, $"${idName}"} },
+                        variables: new {id = pairAddress},
+                        cancellationToken: cancellationToken)).Pair)
+                    : null;
             }
 
             return new Pair
@@ -56,9 +65,9 @@ namespace BatBot.Server.Services
                 new Token
                 {
                     Id = tokenAddresses.TokenB,
-                    Decimals = await _blockchainService.ContractQuery<DecimalsFunction, int>(web3, address),
+                    Decimals = await _smartContractService.ContractQuery<DecimalsFunction, int>(web3, address),
                     Symbol = await web3.Eth.GetContractQueryHandler<SymbolFunction>().QueryAsync<string>(address),
-                    TotalSupply = await _blockchainService.ContractQuery<TotalSupplyFunction, BigInteger>(web3, address)
+                    TotalSupply = await _smartContractService.ContractQuery<TotalSupplyFunction, BigInteger>(web3, address)
                 };
         }
     }
