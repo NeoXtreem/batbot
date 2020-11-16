@@ -57,6 +57,7 @@ namespace BatBot.Server.Services
 
             return new Pair
             {
+                Id = pairAddress,
                 Token0 = await GetToken(tokenAddresses.TokenA),
                 Token1 = await GetToken(tokenAddresses.TokenB)
             };
@@ -64,7 +65,7 @@ namespace BatBot.Server.Services
             async Task<Token> GetToken(string address) =>
                 new Token
                 {
-                    Id = tokenAddresses.TokenB,
+                    Id = address,
                     Decimals = await _smartContractService.ContractQuery<DecimalsFunction, int>(web3, address),
                     Symbol = await web3.Eth.GetContractQueryHandler<SymbolFunction>().QueryAsync<string>(address),
                     TotalSupply = await _smartContractService.ContractQuery<TotalSupplyFunction, BigInteger>(web3, address)

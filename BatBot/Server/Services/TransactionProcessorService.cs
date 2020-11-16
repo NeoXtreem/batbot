@@ -42,6 +42,7 @@ namespace BatBot.Server.Services
         private readonly SmartContractService _smartContractService;
 
         private readonly HashSet<string> _pairWhitelist = new HashSet<string>();
+        private readonly HashSet<string> _pairBlacklist = new HashSet<string>();
 
         public TransactionProcessorService(
             IOptionsFactory<BatBotOptions> batBotOptionsFactory,
@@ -98,6 +99,12 @@ namespace BatBot.Server.Services
 
                 if (!_settingsOptions.YoloMode)
                 {
+                    if (_pairBlacklist.Contains(pair.Id))
+                    {
+                        await SendPreFrontRunMessage("⛔ This token is blacklisted from a previous validation", MessageTier.End);
+                        return;
+                    }
+
                     // Ignore transactions that are outside of the configured ETH range.
                     if (!swap.AmountIn.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)))
                     {
@@ -124,7 +131,7 @@ namespace BatBot.Server.Services
 
                         if (!_pairWhitelist.Contains(pair.Id))
                         {
-                            // Check that the pair contract wasn't created too recently to protect against possible scam coins.
+                            // Check that the pair contract wasn't created too recently to protect against possible honeypots.
                             if (pair.Created.AddDays(_settingsOptions.MinimumPairContractAge) > DateTime.UtcNow)
                             {
                                 await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pair.Created:g})", MessageTier.End);
@@ -133,15 +140,15 @@ namespace BatBot.Server.Services
 
                             // Check that there have been historical swaps selling the output token, to ensure the contract is legitimate.
                             var idName = JsonHelper.GetJsonPropertyName<PairType>(nameof(PairType.Id));
-
                             var recentSwaps = new List<Models.Graph.Swap>();
                             int previousCount;
 
                             do
                             {
+                                // Retrieve the swaps in batches until there are no more fetched, or the configured threshold is reached.
                                 previousCount = recentSwaps.Count;
                                 recentSwaps.AddRange(_mapper.Map<IEnumerable<Models.Graph.Swap>>((await _graphService.SendQuery<SwapsResponse>(
-                                    new Dictionary<string, string> { { idName, Graph.Types.Id } },
+                                    new Dictionary<string, string> {{idName, Graph.Types.Id}},
                                     new Dictionary<string, object>
                                     {
                                         {Graph.OrderBy, JsonHelper.GetJsonPropertyName<SwapType>(nameof(SwapType.Timestamp))},
@@ -157,23 +164,23 @@ namespace BatBot.Server.Services
                                     {
                                         {nameof(SwapType), new HashSet<string> {nameof(SwapType.Pair)}}
                                     },
-                                    new { id = pair.Id },
+                                    new {id = pair.Id},
                                     cancellationToken: cancellationToken)).Swaps));
                             } while (recentSwaps.Count.Between(previousCount, _settingsOptions.HistoricalAnalysisMinFetchThreshold, false));
 
                             var relevantSwaps = (await Task.WhenAll(recentSwaps.Select(async s => await _ethereumService.GetSwap(s.Transaction.Id)))).Where(s => s != null).ToArray();
-
                             if (relevantSwaps.Length < _settingsOptions.HistoricalAnalysisMinRelevantSwaps)
                             {
                                 await SendPreFrontRunMessage($"⛔ Number of relevant swaps ({relevantSwaps.Length} out of {recentSwaps.Count}) is too low.", MessageTier.End);
+                                _pairBlacklist.Add(pair.Id);
                                 return;
                             }
 
                             var uniqueRecipients = relevantSwaps.GroupBy(s => s.To).Count();
-
                             if (uniqueRecipients / (double)relevantSwaps.Length < _settingsOptions.MinimumUniqueSellRecipientsRatio)
                             {
                                 await SendPreFrontRunMessage($"⛔ Number of unique recipients in the relevant swaps ({uniqueRecipients} out of {relevantSwaps.Length}) is too low.", MessageTier.End);
+                                _pairBlacklist.Add(pair.Id);
                                 return;
                             }
 
