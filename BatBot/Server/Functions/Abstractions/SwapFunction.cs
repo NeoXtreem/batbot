@@ -9,12 +9,12 @@ namespace BatBot.Server.Functions.Abstractions
     public abstract class SwapFunction : FunctionMessage
     {
         [Parameter(Uniswap.Types.AddressArray, "path", 2)]
-        public virtual List<string> Path { get; set; }
+        public List<string> Path { get; set; }
 
         [Parameter(Uniswap.Types.Address, "to", 3)]
-        public virtual string To { get; set; }
+        public string To { get; set; }
 
         [Parameter(Uniswap.Types.UInt256, "deadline", 4)]
-        public virtual BigInteger Deadline { get; set; }
+        public BigInteger Deadline { get; set; }
     }
 }

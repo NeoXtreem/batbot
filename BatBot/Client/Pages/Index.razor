@@ -81,19 +81,19 @@
         await _hubConnection.StartAsync();
     }
 
-    public async Task MonitorMempool()
+    private async Task MonitorMempool()
     {
-        var response = await Http.PostAsync("BatBot/MonitorMempool", null);
+        var response = await Http.PostAsync("BatBot/MonitorMempool", null!);
     }
 
-    public async Task MonitorBlocknativeWebhook()
+    private async Task MonitorBlocknativeWebhook()
     {
-        var response = await Http.PostAsync("BatBot/MonitorBlocknativeWebhook", null);
+        var response = await Http.PostAsync("BatBot/MonitorBlocknativeWebhook", null!);
     }
 
-    public async Task MonitorBlocknativeWebSocket()
+    private async Task MonitorBlocknativeWebSocket()
     {
-        var response = await Http.PostAsync("BatBot/MonitorBlocknativeWebSocket", null);
+        var response = await Http.PostAsync("BatBot/MonitorBlocknativeWebSocket", null!);
     }
 
     public void Dispose()

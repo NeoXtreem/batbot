@@ -8,10 +8,10 @@ namespace BatBot.Server.Functions
     [Function("getAmountsOut", "uint256[]")]
     public class GetAmountsOutFunction : FunctionMessage
     {
-        [Parameter("uint256", "amountIn", 1)]
-        public virtual BigInteger AmountIn { get; set; }
+        [Parameter("uint256", "amountIn")]
+        public BigInteger AmountIn { get; set; }
 
         [Parameter("address[]", "path", 2)]
-        public virtual List<string> Path { get; set; }
+        public List<string> Path { get; set; }
     }
 }

@@ -41,8 +41,7 @@ namespace BatBot.Server.Services
         private readonly EthereumService _ethereumService;
         private readonly SmartContractService _smartContractService;
 
-        private readonly HashSet<string> _pairWhitelist = new HashSet<string>();
-        private readonly HashSet<string> _pairBlacklist = new HashSet<string>();
+        private readonly Dictionary<string, bool> _pairWhitelist = new Dictionary<string, bool>();
 
         public TransactionProcessorService(
             IOptionsFactory<BatBotOptions> batBotOptionsFactory,
@@ -99,45 +98,28 @@ namespace BatBot.Server.Services
 
                 if (!_settingsOptions.YoloMode)
                 {
-                    if (_pairBlacklist.Contains(pair.Id))
+                    if (_pairWhitelist.TryGetValue(pair.Id, out var allowed) && !allowed)
                     {
                         await SendPreFrontRunMessage("⛔ This token is blacklisted from a previous validation", MessageTier.End);
                         return;
                     }
 
-                    // Ignore transactions that are outside of the configured ETH range.
-                    if (!swap.AmountIn.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)))
+                    var swapChecks = new List<Func<Task<(bool, string)>>>
                     {
-                        await SendPreFrontRunMessage("⛔ Amount to send outside of the configured range", MessageTier.End);
-                        return;
-                    }
+                        // Ignore transactions that are outside of the configured ETH range.
+                        async () => (await Task.Run(() => swap.AmountIn.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)), cancellationToken), "Amount to send outside of the configured range"),
+                        // Ignore transactions with too high gas price.
+                        async () => (await Task.Run(() => swap.GasPrice <= Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei), cancellationToken), "Gas price higher than the configured limit")
+                    };
 
-                    // Ignore transactions with too high gas price.
-                    if (swap.GasPrice > Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei))
-                    {
-                        await SendPreFrontRunMessage("⛔ Gas price higher than the configured limit", MessageTier.End);
-                        return;
-                    }
-
-                    // No need to perform the following check on a testnet.
-                    if (_batBotOptions.Network == BatBotOptions.Mainnet)
+                    var pairChecks = new List<Func<Task<(bool, string)>>>
                     {
                         // Check that the liquidity of the token pair is within the configured range.
-                        if (!pair.ReserveUsd.Between((Rational)_settingsOptions.MinimumLiquidity, (Rational)_settingsOptions.MaximumLiquidity))
+                        async () => (await Task.Run(() => pair.ReserveUsd.Between((Rational)_settingsOptions.MinimumLiquidity, (Rational)_settingsOptions.MaximumLiquidity), cancellationToken), $"Liquidity (${pair.ReserveUsd.WholePart:N0}) outside of the configured range"),
+                        // Check that the pair contract wasn't created too recently to protect against possible honeypots.
+                        async () => (await Task.Run(() => pair.Created.AddDays(_settingsOptions.MinimumPairContractAge) < DateTime.UtcNow, cancellationToken), $"Pair contract created too recently ({pair.Created:g})"),
+                        async () =>
                         {
-                            await SendPreFrontRunMessage($"⛔ Liquidity (${pair.ReserveUsd.WholePart:N0}) outside of the configured range", MessageTier.End);
-                            return;
-                        }
-
-                        if (!_pairWhitelist.Contains(pair.Id))
-                        {
-                            // Check that the pair contract wasn't created too recently to protect against possible honeypots.
-                            if (pair.Created.AddDays(_settingsOptions.MinimumPairContractAge) > DateTime.UtcNow)
-                            {
-                                await SendPreFrontRunMessage($"⛔ Pair contract created too recently ({pair.Created:g})", MessageTier.End);
-                                return;
-                            }
-
                             // Check that there have been historical swaps selling the output token, to ensure the contract is legitimate.
                             var idName = JsonHelper.GetJsonPropertyName<PairType>(nameof(PairType.Id));
                             var recentSwaps = new List<Models.Graph.Swap>();
@@ -171,21 +153,48 @@ namespace BatBot.Server.Services
                             var relevantSwaps = (await Task.WhenAll(recentSwaps.Select(async s => await _ethereumService.GetSwap(s.Transaction.Id)))).Where(s => s != null).ToArray();
                             if (relevantSwaps.Length < _settingsOptions.HistoricalAnalysisMinRelevantSwaps)
                             {
-                                await SendPreFrontRunMessage($"⛔ Number of relevant swaps ({relevantSwaps.Length} out of {recentSwaps.Count}) is too low.", MessageTier.End);
-                                _pairBlacklist.Add(pair.Id);
-                                return;
+                                return (false, $"Number of relevant swaps ({relevantSwaps.Length} out of {recentSwaps.Count}) is too low.");
                             }
 
                             var uniqueRecipients = relevantSwaps.GroupBy(s => s.To).Count();
-                            if (uniqueRecipients / (double)relevantSwaps.Length < _settingsOptions.MinimumUniqueSellRecipientsRatio)
-                            {
-                                await SendPreFrontRunMessage($"⛔ Number of unique recipients in the relevant swaps ({uniqueRecipients} out of {relevantSwaps.Length}) is too low.", MessageTier.End);
-                                _pairBlacklist.Add(pair.Id);
-                                return;
-                            }
-
-                            _pairWhitelist.Add(pair.Id);
+                            return uniqueRecipients / (double)relevantSwaps.Length < _settingsOptions.MinimumUniqueSellRecipientsRatio
+                                ? (false, $"Number of unique recipients in the relevant swaps ({uniqueRecipients} out of {relevantSwaps.Length}) is too low.")
+                                : (true, default);
                         }
+                    };
+
+                    var failures = await DoChecks(swapChecks);
+                    if (failures > 0 && _settingsOptions.DiscardSwapAsSoonAsInvalid) return;
+
+                    // No need to perform pair checks on a testnet.
+                    if (_batBotOptions.Network == BatBotOptions.Mainnet && !allowed)
+                    {
+                        var pairFailures = await DoChecks(pairChecks);
+                        if ((_pairWhitelist[pair.Id] = pairFailures > 0) && _settingsOptions.DiscardSwapAsSoonAsInvalid) return;
+                        failures += pairFailures;
+                    }
+
+                    if (failures > 0)
+                    {
+                        await SendPreFrontRunMessage($"🔚 {failures} validation failures found", MessageTier.End);
+                        return;
+                    }
+
+                    async Task<int> DoChecks(IEnumerable<Func<Task<(bool, string)>>> checks)
+                    {
+                        var failedChecks = 0;
+                        foreach (var check in checks)
+                        {
+                            var (condition, message) = await check();
+                            if (!condition)
+                            {
+                                failedChecks++;
+                                await SendPreFrontRunMessage($"⛔ {message}", _settingsOptions.DiscardSwapAsSoonAsInvalid ? MessageTier.End : MessageTier.None);
+                                if (_settingsOptions.DiscardSwapAsSoonAsInvalid) break;
+                            }
+                        }
+
+                        return failedChecks;
                     }
                 }
 

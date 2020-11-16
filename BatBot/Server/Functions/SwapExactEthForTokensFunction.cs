@@ -8,7 +8,7 @@ namespace BatBot.Server.Functions
     [Function(Uniswap.SwapExactEthForTokens, Uniswap.Types.UInt256Array)]
     public class SwapExactEthForTokensFunction : SwapFunction
     {
-        [Parameter(Uniswap.Types.UInt256, "amountOutMin", 1)]
-        public virtual BigInteger AmountOutMin { get; set; }
+        [Parameter(Uniswap.Types.UInt256, "amountOutMin")]
+        public BigInteger AmountOutMin { get; set; }
     }
 }
