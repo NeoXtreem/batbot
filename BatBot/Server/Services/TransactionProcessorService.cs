@@ -94,120 +94,123 @@ namespace BatBot.Server.Services
                 var swapMessage = $"💱 Swap {Web3.Convert.FromWei(swap.AmountIn)} {tokenIn.Symbol} for {Web3.Convert.FromWei(swap.AmountOutMin, tokenOut.Decimals)} {tokenOut.Symbol} with gas price {Web3.Convert.FromWei(swap.GasPrice.GetValueOrDefault(), UnitConversion.EthUnit.Gwei)} Gwei";
                 await SendPreFrontRunMessage(swapMessage, MessageTier.End | MessageTier.Single);
 
-                #region Validation
-
-                if (!_settingsOptions.YoloMode)
-                {
-                    if (_pairWhitelist.TryGetValue(pair.Id, out var allowed) && !allowed)
-                    {
-                        await SendPreFrontRunMessage("⛔ This token is blacklisted from a previous validation", MessageTier.End);
-                        return;
-                    }
-
-                    var swapChecks = new List<Func<Task<(bool, string)>>>
-                    {
-                        // Ignore transactions that are outside of the configured ETH range.
-                        async () => (await Task.Run(() => swap.AmountIn.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)), cancellationToken), "Amount to send outside of the configured range"),
-                        // Ignore transactions with too high gas price.
-                        async () => (await Task.Run(() => swap.GasPrice <= Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei), cancellationToken), "Gas price higher than the configured limit")
-                    };
-
-                    var pairChecks = new List<Func<Task<(bool, string)>>>
-                    {
-                        // Check that the liquidity of the token pair is within the configured range.
-                        async () => (await Task.Run(() => pair.ReserveUsd.Between((Rational)_settingsOptions.MinimumLiquidity, (Rational)_settingsOptions.MaximumLiquidity), cancellationToken), $"Liquidity (${pair.ReserveUsd.WholePart:N0}) outside of the configured range"),
-                        // Check that the pair contract wasn't created too recently to protect against possible honeypots.
-                        async () => (await Task.Run(() => pair.Created.AddDays(_settingsOptions.MinimumPairContractAge) < DateTime.UtcNow, cancellationToken), $"Pair contract created too recently ({pair.Created:g})"),
-                        async () =>
-                        {
-                            // Check that there have been historical swaps selling the output token, to ensure the contract is legitimate.
-                            var idName = JsonHelper.GetJsonPropertyName<PairType>(nameof(PairType.Id));
-                            var recentSwaps = new List<Models.Graph.Swap>();
-                            int previousCount;
-
-                            do
-                            {
-                                // Retrieve the swaps in batches until there are no more fetched, or the configured threshold is reached.
-                                previousCount = recentSwaps.Count;
-                                recentSwaps.AddRange(_mapper.Map<IEnumerable<Models.Graph.Swap>>((await _graphService.SendQuery<SwapsResponse>(
-                                    new Dictionary<string, string> {{idName, Graph.Types.Id}},
-                                    new Dictionary<string, object>
-                                    {
-                                        {Graph.OrderBy, JsonHelper.GetJsonPropertyName<SwapType>(nameof(SwapType.Timestamp))},
-                                        {Graph.OrderDirection, Graph.Descending},
-                                        {Graph.Where, new Dictionary<string, object>
-                                        {
-                                            {JsonHelper.GetJsonPropertyName<PairResponse>(nameof(PairResponse.Pair)), $"${idName}"},
-                                            {$"{JsonHelper.GetJsonPropertyName<SwapType>(pair.GetToken(tokenIn.Id) == pair.Token0 ? nameof(SwapType.Amount0Out) : nameof(SwapType.Amount1Out))}{Graph.Gte}", _settingsOptions.HistoricalAnalysisMinEthOut},
-                                            {$"{JsonHelper.GetJsonPropertyName<SwapType>(nameof(SwapType.Timestamp))}{Graph.Lt}", recentSwaps.Any() ? ((DateTimeOffset)recentSwaps.Last().Timestamp).ToUnixTimeSeconds() : DateTimeOffset.UtcNow.ToUnixTimeSeconds()}
-                                        }}
-                                    },
-                                    new Dictionary<string, HashSet<string>>
-                                    {
-                                        {nameof(SwapType), new HashSet<string> {nameof(SwapType.Pair)}}
-                                    },
-                                    new {id = pair.Id},
-                                    cancellationToken: cancellationToken)).Swaps));
-                            } while (recentSwaps.Count.Between(previousCount, _settingsOptions.HistoricalAnalysisMinFetchThreshold, false));
-
-                            var relevantSwaps = (await Task.WhenAll(recentSwaps.Select(async s => await _ethereumService.GetSwap(s.Transaction.Id)))).Where(s => s != null).ToArray();
-                            if (relevantSwaps.Length < _settingsOptions.HistoricalAnalysisMinRelevantSwaps)
-                            {
-                                return (false, $"Number of relevant swaps ({relevantSwaps.Length} out of {recentSwaps.Count}) is too low.");
-                            }
-
-                            var uniqueRecipients = relevantSwaps.GroupBy(s => s.To).Count();
-                            return uniqueRecipients / (double)relevantSwaps.Length < _settingsOptions.MinimumUniqueSellRecipientsRatio
-                                ? (false, $"Number of unique recipients in the relevant swaps ({uniqueRecipients} out of {relevantSwaps.Length}) is too low.")
-                                : (true, default);
-                        }
-                    };
-
-                    var failures = await DoChecks(swapChecks);
-                    if (failures > 0 && _settingsOptions.DiscardSwapAsSoonAsInvalid) return;
-
-                    // No need to perform pair checks on a testnet.
-                    if (_batBotOptions.Network == BatBotOptions.Mainnet && !allowed)
-                    {
-                        var pairFailures = await DoChecks(pairChecks);
-                        if ((_pairWhitelist[pair.Id] = pairFailures > 0) && _settingsOptions.DiscardSwapAsSoonAsInvalid) return;
-                        failures += pairFailures;
-                    }
-
-                    if (failures > 0)
-                    {
-                        await SendPreFrontRunMessage($"🔚 {failures} validation failures found", MessageTier.End);
-                        return;
-                    }
-
-                    async Task<int> DoChecks(IEnumerable<Func<Task<(bool, string)>>> checks)
-                    {
-                        var failedChecks = 0;
-                        foreach (var check in checks)
-                        {
-                            var (condition, message) = await check();
-                            if (!condition)
-                            {
-                                failedChecks++;
-                                await SendPreFrontRunMessage($"⛔ {message}", _settingsOptions.DiscardSwapAsSoonAsInvalid ? MessageTier.End : MessageTier.None);
-                                if (_settingsOptions.DiscardSwapAsSoonAsInvalid) break;
-                            }
-                        }
-
-                        return failedChecks;
-                    }
-                }
-
-                #endregion
-
                 try
                 {
+                    #region Validation
+
+                    if (!_settingsOptions.YoloMode)
+                    {
+                        if (_pairWhitelist.TryGetValue(pair.Id, out var allowed) && !allowed)
+                        {
+                            await SendPreFrontRunMessage("⛔ This token is blacklisted from a previous validation", MessageTier.End);
+                            return;
+                        }
+
+                        var swapChecks = new List<Func<Task<(bool, string)>>>
+                        {
+                            // Ignore transactions that are outside of the configured ETH range.
+                            async () => (await Task.Run(() => swap.AmountIn.Between(Web3.Convert.ToWei(_settingsOptions.MinimumTargetSwapEth), Web3.Convert.ToWei(_settingsOptions.MaximumTargetSwapEth)), cancellationToken), "Amount to send outside of the configured range"),
+                            // Ignore transactions with too high gas price.
+                            async () => (await Task.Run(() => swap.GasPrice <= Web3.Convert.ToWei(_settingsOptions.MaximumGasPrice, UnitConversion.EthUnit.Gwei), cancellationToken), "Gas price higher than the configured limit")
+                        };
+
+                        var pairChecks = new List<Func<Task<(bool, string)>>>
+                        {
+                            // Check that the liquidity of the token pair is within the configured range.
+                            async () => (await Task.Run(() => pair.ReserveUsd.Between((Rational)_settingsOptions.MinimumLiquidity, (Rational)_settingsOptions.MaximumLiquidity), cancellationToken), $"Liquidity (${pair.ReserveUsd.WholePart:N0}) outside of the configured range"),
+                            // Check that the pair contract wasn't created too recently to protect against possible honeypots.
+                            async () => (await Task.Run(() => pair.Created.AddDays(_settingsOptions.MinimumPairContractAge) < DateTime.UtcNow, cancellationToken), $"Pair contract created too recently ({pair.Created:g})"),
+                            async () =>
+                            {
+                                // Check that there have been historical swaps selling the output token, to ensure the contract is legitimate.
+                                var idName = JsonHelper.GetJsonPropertyName<PairType>(nameof(PairType.Id));
+                                var recentSwaps = new List<Models.Graph.Swap>();
+                                int previousCount;
+
+                                do
+                                {
+                                    // Retrieve the swaps in batches until there are no more fetched, or the configured threshold is reached.
+                                    previousCount = recentSwaps.Count;
+                                    recentSwaps.AddRange(_mapper.Map<IEnumerable<Models.Graph.Swap>>((await _graphService.SendQuery<SwapsResponse>(
+                                        new Dictionary<string, string> {{idName, Graph.Types.Id}},
+                                        new Dictionary<string, object>
+                                        {
+                                            {Graph.OrderBy, JsonHelper.GetJsonPropertyName<SwapType>(nameof(SwapType.Timestamp))},
+                                            {Graph.OrderDirection, Graph.Descending},
+                                            {Graph.Where, new Dictionary<string, object>
+                                            {
+                                                {JsonHelper.GetJsonPropertyName<PairResponse>(nameof(PairResponse.Pair)), $"${idName}"},
+                                                {$"{JsonHelper.GetJsonPropertyName<SwapType>(pair.GetToken(tokenIn.Id) == pair.Token0 ? nameof(SwapType.Amount0Out) : nameof(SwapType.Amount1Out))}{Graph.Gte}", _settingsOptions.HistoricalAnalysisMinEthOut},
+                                                {$"{JsonHelper.GetJsonPropertyName<SwapType>(nameof(SwapType.Timestamp))}{Graph.Lt}", recentSwaps.Any() ? ((DateTimeOffset)recentSwaps.Last().Timestamp).ToUnixTimeSeconds() : DateTimeOffset.UtcNow.ToUnixTimeSeconds()}
+                                            }}
+                                        },
+                                        new Dictionary<string, HashSet<string>>
+                                        {
+                                            {nameof(SwapType), new HashSet<string> {nameof(SwapType.Pair)}}
+                                        },
+                                        new {id = pair.Id},
+                                        cancellationToken: cancellationToken)).Swaps));
+                                } while (recentSwaps.Count.Between(previousCount, _settingsOptions.HistoricalAnalysisMinFetchThreshold, false));
+
+                                var relevantSwaps = (await Task.WhenAll(recentSwaps.Select(async s => await _ethereumService.GetSwap(s.Transaction.Id)))).Where(s => s != null).ToArray();
+                                if (relevantSwaps.Length < _settingsOptions.HistoricalAnalysisMinRelevantSwaps)
+                                {
+                                    return (false, $"Number of relevant swaps ({relevantSwaps.Length} out of {recentSwaps.Count}) is too low.");
+                                }
+
+                                var uniqueRecipients = relevantSwaps.GroupBy(s => s.To).Count();
+                                return uniqueRecipients / (double)relevantSwaps.Length < _settingsOptions.MinimumUniqueSellRecipientsRatio
+                                    ? (false, $"Number of unique recipients in the relevant swaps ({uniqueRecipients} out of {relevantSwaps.Length}) is too low.")
+                                    : (true, default);
+                            }
+                        };
+
+                        var failures = await DoChecks(swapChecks);
+                        if (failures > 0 && _settingsOptions.DiscardSwapAsSoonAsInvalid) return;
+
+                        // No need to perform pair checks on a testnet.
+                        if (_batBotOptions.Network == BatBotOptions.Mainnet && !allowed)
+                        {
+                            var pairFailures = await DoChecks(pairChecks);
+                            if (pairFailures > 0)
+                            {
+                                _pairWhitelist[pair.Id] = false;
+                                 if (_settingsOptions.DiscardSwapAsSoonAsInvalid) return;
+                            }
+                            failures += pairFailures;
+                        }
+
+                        if (failures > 0)
+                        {
+                            await SendPreFrontRunMessage($"🔚 {failures} validation failures found", MessageTier.End);
+                            return;
+                        }
+
+                        async Task<int> DoChecks(IEnumerable<Func<Task<(bool, string)>>> checks)
+                        {
+                            var failedChecks = 0;
+                            foreach (var check in checks)
+                            {
+                                var (condition, message) = await check();
+                                if (!condition)
+                                {
+                                    failedChecks++;
+                                    await SendPreFrontRunMessage($"⛔ {message}", _settingsOptions.DiscardSwapAsSoonAsInvalid ? MessageTier.End : MessageTier.None);
+                                    if (_settingsOptions.DiscardSwapAsSoonAsInvalid) break;
+                                }
+                            }
+
+                            return failedChecks;
+                        }
+                    }
+
+                    #endregion
+
                     #region Preparation
 
                     var frontRunAmountIn = swap.AmountIn;
                     BigInteger frontRunAmountOutMin;
                     BigInteger targetSwapAmountOut;
-                    var adjustmentFactor = 0.5;
 
                     do
                     {
@@ -237,8 +240,7 @@ namespace BatBot.Server.Services
                         }
 
                         // Adjust front run amount iteratively to get as close as possible to the amount that won't cause the target swap to fail, but keep within configured bounds.
-                        frontRunAmountIn = BigInteger.Max(BigInteger.Min((frontRunAmountIn * (Rational)(1 + adjustmentFactor * (targetSwapAmountOutBelowMax ? -1 : 1))).WholePart, frontRunAmountInMax), frontRunAmountInMin);
-                        adjustmentFactor /= 2;
+                        frontRunAmountIn = BigInteger.Max(BigInteger.Min((frontRunAmountIn * (Rational)(targetSwapAmountOutBelowMax ? 0.5 : 1.5)).WholePart, frontRunAmountInMax), frontRunAmountInMin);
                     } while (true);
 
                     // Calculate the slippage as the difference between the amounts out and amounts in ratios, then compare to the tolerance.
@@ -398,7 +400,7 @@ namespace BatBot.Server.Services
 
                     #endregion
                 }
-                catch (Exception e) when (e is RpcResponseException || e is SmartContractRevertException)
+                catch (Exception e) when (e is RpcResponseException || e is RpcClientUnknownException || e is SmartContractRevertException)
                 {
                     await _messagingService.SendTxMessage($"❌ Failed with error '{e.Message}'", MessageTier.End);
                 }
